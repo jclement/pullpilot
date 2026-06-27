@@ -501,6 +501,44 @@ check — so `GET` is safe. Still, treat the poke URL as a **write-capable secre
 don't paste it anywhere that auto-fetches links (a chat that unfurls URLs, an HTML
 `<img src>`). Abandoned webhooks are auto-pruned after 6 months of inactivity.
 
+### When to fire the poke (timing matters!)
+
+> ⚠️ **Fire the poke *after* the new image is pushed to the registry — not on
+> `git push`.** A poke just makes PullPilot re-check the registry *now*. If you
+> trigger it before your build has pushed the image (e.g. from a GitHub `push`
+> event), PullPilot checks, sees the **same old digest**, and does nothing — then
+> the image lands minutes later with no poke, and you wait for the next scheduled
+> poll. Wire the trigger to the moment the image actually exists.
+
+**Best: the last step of your build/release pipeline**, after `docker push`
+succeeds. Store the poke URL as a secret and `curl` it:
+
+```yaml
+# .github/workflows/release.yml — after the image is pushed
+- name: Notify PullPilot
+  run: curl -fsS -X POST "${{ secrets.PULLPILOT_POKE_URL }}"
+```
+
+```bash
+# any CI / Makefile / script, right after `docker push …`
+curl -fsS -X POST "$PULLPILOT_POKE_URL"
+```
+
+**Or a registry "image pushed" webhook** — these fire only once the image is in
+the registry, so the timing is correct:
+
+- **Docker Hub** → repository **Webhooks** → add your poke URL.
+- **GitHub Container Registry (GHCR)** → repo/org webhook on the
+  **`registry_package` / `package` — *published*** event (this fires when the
+  image is published, **not** on `git push`).
+- **Harbor / others** → the registry's push/notification webhook.
+
+**Heads-up on soak:** a correctly-timed poke *starts the soak clock* the moment
+the image lands — it doesn't roll out instantly under the default `PP_SOAK=24h`.
+For near-immediate rollout on a poke, set `PP_SOAK=0` (or per service via
+`io.pullpilot.soak: 0`). A mistimed or duplicate poke is always harmless
+(idempotent + debounced), and the scheduled poll is the backstop.
+
 ### Self-hosting the relay
 
 The relay holds **no shared secret** — your per-webhook ed25519 keypair is the
