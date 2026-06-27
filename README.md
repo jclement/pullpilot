@@ -170,8 +170,14 @@ environment:
 ```
 
 On first start PullPilot provisions a webhook and logs your **poke URL**. Point
-your CI / registry webhook at it (`POST` or `GET`). Abandoned webhooks are
-auto-pruned after 6 months of inactivity.
+your CI / registry webhook at it — **either `POST` or `GET`** works, so even tools
+that only do a plain `GET` (registries, `wget`/`curl` in cron) can trigger it.
+
+Because a poke is non-authoritative (it can never name an image or skip a gate),
+the worst anything can do by hitting the URL is cause one extra, rate-limited
+check — so `GET` is safe. Still, treat the poke URL as a **write-capable secret**:
+don't paste it anywhere that auto-fetches links (a chat that unfurls URLs, an HTML
+`<img src>`). Abandoned webhooks are auto-pruned after 6 months of inactivity.
 
 ### Self-hosting the relay
 
