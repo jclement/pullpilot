@@ -81,6 +81,10 @@ With zero extra config, PullPilot polls **its own compose project nightly at
 failures, and touches nothing else. Webhook, image cleanup, and self-update are
 all **off** until you opt in.
 
+> Want to watch it work first? [`samples/playground/`](samples/playground/) is a
+> safe debug + dry-run stack with the webhook on — `docker compose -f
+> samples/playground/docker-compose.yml up`.
+
 ---
 
 ## Image tags

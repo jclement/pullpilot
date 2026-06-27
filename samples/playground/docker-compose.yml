@@ -1,0 +1,45 @@
+# PullPilot playground — a safe place to watch it work.
+#
+#   docker compose -f samples/playground/docker-compose.yml up
+#
+# What's intentionally different from a real deployment:
+#   • PP_LOG_LEVEL=debug      — see every poll, digest comparison and decision
+#   • PP_DRY_RUN=true         — it reports what it WOULD do but restarts nothing
+#   • PP_SCHEDULE every 2 min — so you see cycles quickly (plus one on startup)
+#   • PP_WEBHOOK=true, NO volume for /data — so you can watch it provision a
+#     webhook and see the "data dir is NOT a persistent mount" warning fire
+#     (in real life you'd mount a volume so the URL survives restarts).
+#
+# On startup, look in the logs for a line like:
+#   relay connected  poke_url=https://pullpilot-relay-test.../v1/poke/wh_...
+# then trigger an instant (debounced) check and watch it run:
+#   curl -X POST '<that poke URL>'
+#
+# whoami + nginx below are throwaway targets in THIS compose project, so the
+# default project scope picks them up automatically — no labels required.
+
+services:
+  pullpilot:
+    image: ghcr.io/jclement/pullpilot:latest   # edge build (defaults to the TEST relay)
+    container_name: pp-playground
+    environment:
+      PP_LOG_LEVEL: debug
+      PP_DRY_RUN: "true"
+      PP_SCHEDULE: "*/2 * * * *"
+      PP_JITTER: "0"            # no jitter so scheduled runs fire immediately
+      PP_WEBHOOK: "true"
+      PP_DATA_DIR: /data        # deliberately NOT a volume — ephemeral
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    user: "0:0"
+    restart: unless-stopped
+
+  whoami:
+    image: traefik/whoami
+    container_name: pp-playground-whoami
+
+  nginx:
+    image: nginx:stable
+    container_name: pp-playground-nginx
+    labels:
+      io.pullpilot.monitor-only: "true"   # example: detect + notify, never update
