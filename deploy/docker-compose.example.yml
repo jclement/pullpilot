@@ -25,6 +25,12 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - pullpilot-data:/data
+      # Private registries: mount your Docker auth read-only so PullPilot can
+      # pull private images. It runs as root (below), so its home is /root.
+      # Run `docker login <registry>` first; the file must contain inline
+      # "auths" (a server login with NO credential helper — `credsStore`/
+      # `credHelpers` keep tokens in the OS keychain, which a container can't read).
+      # - ${HOME}/.docker/config.json:/root/.docker/config.json:ro
     user: "0:0"                          # root, to access the docker socket
     read_only: true                      # cheap hardening: nothing writes the rootfs
     cap_drop: [ALL]

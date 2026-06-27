@@ -296,7 +296,7 @@ config read-only:
 volumes:
   - /var/run/docker.sock:/var/run/docker.sock
   - pullpilot-data:/data
-  - ~/.docker/config.json:/root/.docker/config.json:ro
+  - ${HOME}/.docker/config.json:/root/.docker/config.json:ro
 ```
 
 If PullPilot runs **non-root** (e.g. the socket-proxy sample, `user: "65532:65532"`,
@@ -307,12 +307,15 @@ home-independent, set `DOCKER_CONFIG`:
 environment:
   DOCKER_CONFIG: /pp-docker
 volumes:
-  - ~/.docker/config.json:/pp-docker/config.json:ro
+  - ${HOME}/.docker/config.json:/pp-docker/config.json:ro
 ```
 
-PullPilot reads only the `auths` block (it does **not** run credential helpers),
-so a plain `docker login`-produced `config.json` works. Anonymous Docker Hub pulls
-that hit a rate limit are fixed the same way (`docker login`, then mount the config).
+PullPilot reads only the `auths` block — it does **not** run credential helpers.
+So the mounted `config.json` must contain **inline** `auths` (a `docker login` on
+a server with no `credsStore`/`credHelpers`). On Docker Desktop / setups with a
+credential helper the tokens live in the OS keychain and `config.json` has no
+`auths` to read — log in on the host without a helper, or copy the auth entry in.
+Anonymous Docker Hub pulls that hit a rate limit are fixed the same way.
 
 ### Notifications end-to-end
 
