@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -40,6 +41,23 @@ func TestScopeParsing(t *testing.T) {
 	t.Setenv("PP_SCOPE", "bogus")
 	if _, err := Load(); err == nil {
 		t.Error("expected error for invalid scope")
+	}
+}
+
+func TestUnknownEnvWarns(t *testing.T) {
+	t.Setenv("PP_SOOK", "5m") // typo of PP_SOAK
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, w := range c.Warnings {
+		if strings.Contains(w, "PP_SOOK") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a warning about unknown PP_SOOK, got %v", c.Warnings)
 	}
 }
 

@@ -21,7 +21,14 @@ Then:
    curl -X POST '<poke URL from the logs>'
    ```
    You'll see the debounced cycle fire ~10s later.
-3. Tear it down with `docker compose -f samples/playground/docker-compose.yml down`.
+3. See the same plan as a table without waiting for a cycle:
+   ```bash
+   docker exec pp-playground pullpilot status   # read-only; advances no soak timers
+   docker exec pp-playground pullpilot run      # run one cycle now (dry-run here)
+   ```
+   `nginx` shows as `update available (monitor-only)` thanks to its label; `whoami`
+   is managed automatically because it shares this compose project — no labels.
+4. Tear it down with `docker compose -f samples/playground/docker-compose.yml down`.
 
 To make it actually apply updates, drop `PP_DRY_RUN` and set a short
 `PP_SOAK` (e.g. `PP_SOAK: 1m`). See the main [README](../README.md) for all

@@ -106,6 +106,15 @@ func (s *State) SeenAt(key, digest string, now time.Time) time.Time {
 	return now
 }
 
+// PeekSeen returns the recorded first-seen time for a container/digest without
+// recording one (read-only views). ok is false if it has never been seen.
+func (s *State) PeekSeen(key, digest string) (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.FirstSeen[key+"/"+digest]
+	return t, ok
+}
+
 // MarkBad flags a digest as health-check-failing so it is never retried.
 func (s *State) MarkBad(digest string) {
 	s.mu.Lock()

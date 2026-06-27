@@ -11,6 +11,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/docker/docker/api/types"
@@ -41,12 +42,19 @@ type Engine struct {
 	log  zerolog.Logger
 	note Notifier
 
-	selfID  string
-	project string
+	selfID         string
+	project        string
+	selfIdentified bool
 }
 
 // New connects to Docker, identifies PullPilot's own container, and resolves
 // the default update scope (its own Compose project).
+//
+// Docker SDK note: we intentionally stay on github.com/docker/docker v27.3.1.
+// Its successor, github.com/moby/moby/client, is still pre-1.0 (v0.5.0) with an
+// actively-redesigned API; we'll migrate once it reaches a stable 1.0. The
+// CVEs govulncheck flags on this module are daemon-side and unreachable from a
+// client-only consumer.
 func New(cfg *config.Config, st *state.State, log zerolog.Logger, note Notifier) (*Engine, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
@@ -55,6 +63,24 @@ func New(cfg *config.Config, st *state.State, log zerolog.Logger, note Notifier)
 	e := &Engine{cli: cli, reg: registry.New(), st: st, cfg: cfg, log: log, note: note}
 	e.identifySelf(context.Background())
 	return e, nil
+}
+
+// Ping verifies the Docker daemon is reachable, with an actionable error. The
+// client connects lazily, so without this a missing/forbidden socket only
+// surfaces (cryptically) on the first cycle.
+func (e *Engine) Ping(ctx context.Context) error {
+	if _, err := e.cli.Ping(ctx); err != nil {
+		host := os.Getenv("DOCKER_HOST")
+		if host == "" {
+			host = "unix:///var/run/docker.sock"
+		}
+		return fmt.Errorf("cannot reach the Docker daemon at %s: %w\n"+
+			"  check that the socket is mounted into this container and PullPilot can access it:\n"+
+			"  - mount it:  /var/run/docker.sock:/var/run/docker.sock\n"+
+			"  - access it: run as root (user: \"0:0\") for the default socket, or use rootless Docker / the socket-proxy sample",
+			host, err)
+	}
+	return nil
 }
 
 // Close releases the Docker client.
@@ -66,21 +92,35 @@ func (e *Engine) identifySelf(ctx context.Context) {
 	host, _ := os.Hostname()
 	list, err := e.cli.ContainerList(ctx, container.ListOptions{All: true})
 	if err != nil {
+		e.log.Debug().Err(err).Msg("self-identification: could not list containers")
 		return
 	}
 	for _, c := range list {
 		if host != "" && strings.HasPrefix(c.ID, host) {
-			e.selfID = c.ID
-			e.project = c.Labels[labels.ComposeProject]
-			return
+			e.selfID, e.project, e.selfIdentified = c.ID, c.Labels[labels.ComposeProject], true
+			break
 		}
 	}
-	for _, c := range list {
-		if labels.Parse(c.Labels, false).IsSelf {
-			e.selfID = c.ID
-			e.project = c.Labels[labels.ComposeProject]
-			return
+	if !e.selfIdentified {
+		for _, c := range list {
+			if labels.Parse(c.Labels, false).IsSelf {
+				e.selfID, e.project, e.selfIdentified = c.ID, c.Labels[labels.ComposeProject], true
+				break
+			}
 		}
+	}
+
+	switch {
+	case e.selfIdentified:
+		e.log.Info().Str("project", e.project).Msg("identified PullPilot's own container")
+	case e.cfg.Scope.Mode == "project" && e.cfg.Scope.Project == "":
+		// Only consequential in the default project scope: without a project we
+		// fail safe and manage nothing (see discover).
+		e.log.Warn().Msg("could not identify PullPilot's own container (custom hostname?) — " +
+			"set io.pullpilot.self=true on this service, or set PP_SCOPE=project:<name>. " +
+			"In the default project scope, PullPilot will refuse to manage anything rather than risk host-wide updates.")
+	default:
+		e.log.Debug().Msg("could not identify own container; scope is explicit, continuing")
 	}
 }
 
@@ -110,25 +150,17 @@ type plan struct {
 	running   bool
 }
 
-// Run executes one full cycle. trigger is "schedule" or "webhook" (for logs).
-func (e *Engine) Run(ctx context.Context, trigger string) {
-	start := time.Now()
-	e.log.Info().Str("trigger", trigger).Str("scope", e.scopeLabel()).Msg("update cycle starting")
-
-	// Heal any container left half-recreated by an interrupted previous cycle.
-	e.reconcileOrphans(ctx)
-
+// buildPlan discovers in-scope containers and evaluates each. record controls
+// whether the soak first-seen timestamp is persisted (true for a real cycle,
+// false for read-only views like `status` / dry-run).
+func (e *Engine) buildPlan(ctx context.Context, record bool) ([]plan, error) {
 	targets, err := e.discover(ctx)
 	if err != nil {
-		e.log.Error().Err(err).Msg("discovery failed")
-		return
+		return nil, err
 	}
-
-	var updated, soaking, failed int
 	plans := make([]plan, 0, len(targets))
 	for _, t := range targets {
-		p := e.evaluate(ctx, t)
-		plans = append(plans, p)
+		plans = append(plans, e.evaluate(ctx, t, record))
 	}
 	// Stable, deterministic order (io.pullpilot.order then name).
 	sort.SliceStable(plans, func(i, j int) bool {
@@ -137,19 +169,59 @@ func (e *Engine) Run(ctx context.Context, trigger string) {
 		}
 		return plans[i].name < plans[j].name
 	})
+	return plans, nil
+}
 
+// Status prints a read-only table of every managed container and what PullPilot
+// would do — without changing anything or advancing soak timers.
+func (e *Engine) Status(ctx context.Context) error {
+	plans, err := e.buildPlan(ctx, false)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("scope: %s\n\n", e.scopeLabel())
+	if len(plans) == 0 {
+		fmt.Println("No managed containers in scope.")
+		return nil
+	}
+	e.renderTable(os.Stdout, plans)
+	return nil
+}
+
+// Run executes one full cycle. trigger is "schedule" or "webhook" (for logs).
+func (e *Engine) Run(ctx context.Context, trigger string) {
+	start := time.Now()
+	e.log.Info().Str("trigger", trigger).Str("scope", e.scopeLabel()).Msg("update cycle starting")
+
+	if e.cfg.DryRun {
+		plans, err := e.buildPlan(ctx, false)
+		if err != nil {
+			e.log.Error().Err(err).Msg("discovery failed")
+			return
+		}
+		fmt.Fprintln(os.Stderr, "[dry-run] plan (no changes will be made):")
+		e.renderTable(os.Stderr, plans)
+		return
+	}
+
+	// Heal any container left half-recreated by an interrupted previous cycle.
+	e.reconcileOrphans(ctx)
+
+	plans, err := e.buildPlan(ctx, true)
+	if err != nil {
+		e.log.Error().Err(err).Msg("discovery failed")
+		return
+	}
+
+	var updated, soaking, failed int
 	for _, p := range plans {
 		switch p.action {
 		case ActionUpdate:
-			if e.cfg.DryRun {
-				e.log.Info().Str("container", p.name).Str("image", p.image).
-					Str("from", short(p.current)).Str("to", short(p.available)).
-					Msg("[dry-run] would update")
-				continue
-			}
 			if err := e.apply(ctx, p); err != nil {
 				failed++
 				e.log.Error().Err(err).Str("container", p.name).Msg("update failed")
+				e.note.Notify(ctx, "Update FAILED: "+p.name,
+					fmt.Sprintf("%s could not be updated to %s: %v", p.name, short(p.available), err))
 			} else {
 				updated++
 			}
@@ -183,18 +255,53 @@ func (e *Engine) Run(ctx context.Context, trigger string) {
 }
 
 func (e *Engine) scopeLabel() string {
-	switch e.cfg.Scope.Mode {
-	case "all":
+	if e.cfg.Scope.Mode == "all" {
 		return "all"
-	default:
-		p := e.cfg.Scope.Project
-		if p == "" {
-			p = e.project
-		}
-		if p == "" {
-			return "project:(unknown)"
-		}
+	}
+	if p := e.resolvedProject(); p != "" {
 		return "project:" + p
+	}
+	return "project:(unknown)"
+}
+
+// resolvedProject returns the project to scope to (explicit override, else the
+// self-detected one) in project mode.
+func (e *Engine) resolvedProject() string {
+	if e.cfg.Scope.Project != "" {
+		return e.cfg.Scope.Project
+	}
+	return e.project
+}
+
+// renderTable prints an aligned table of the plan (used by `status` and dry-run).
+func (e *Engine) renderTable(w io.Writer, plans []plan) {
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "SERVICE\tCURRENT\tAVAILABLE\tSTATE")
+	for _, p := range plans {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", p.name, dash(short(p.current)), dash(short(p.available)), stateText(p))
+	}
+	tw.Flush()
+}
+
+func dash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+func stateText(p plan) string {
+	switch p.action {
+	case ActionUpToDate:
+		return "up to date"
+	case ActionUpdate:
+		return "update ready"
+	case ActionSoaking:
+		return fmt.Sprintf("soaking (%s left)", p.soakLeft.Round(time.Minute))
+	case ActionMonitor:
+		return "update available (" + p.reason + ")"
+	default:
+		return p.reason
 	}
 }
 
@@ -202,13 +309,15 @@ func (e *Engine) scopeLabel() string {
 func (e *Engine) discover(ctx context.Context) ([]target, error) {
 	opts := container.ListOptions{All: true}
 	if e.cfg.Scope.Mode == "project" {
-		proj := e.cfg.Scope.Project
+		proj := e.resolvedProject()
 		if proj == "" {
-			proj = e.project
+			// Fail safe: an unknown project must NOT fall back to managing every
+			// container on the host. Manage nothing until self-id or PP_SCOPE is fixed.
+			e.log.Error().Msg("project scope but no project could be determined — managing nothing. " +
+				"Set io.pullpilot.self=true on this service, or set PP_SCOPE=project:<name>.")
+			return nil, nil
 		}
-		if proj != "" {
-			opts.Filters = filters.NewArgs(filters.Arg("label", labels.ComposeProject+"="+proj))
-		}
+		opts.Filters = filters.NewArgs(filters.Arg("label", labels.ComposeProject+"="+proj))
 	}
 	list, err := e.cli.ContainerList(ctx, opts)
 	if err != nil {
@@ -262,8 +371,9 @@ type target struct {
 	running bool
 }
 
-// evaluate decides the action for one container.
-func (e *Engine) evaluate(ctx context.Context, t target) plan {
+// evaluate decides the action for one container. record persists the soak
+// first-seen timestamp; pass false for read-only views.
+func (e *Engine) evaluate(ctx context.Context, t target, record bool) plan {
 	p := plan{id: t.id, name: t.name, image: t.image, inspect: t.inspect, settings: t.set, running: t.running}
 
 	ref, err := registry.ParseRef(t.image)
@@ -285,8 +395,10 @@ func (e *Engine) evaluate(ctx context.Context, t target) plan {
 
 	remote, err := e.reg.RemoteDigest(ctx, t.image)
 	if err != nil {
-		p.action, p.reason = ActionSkip, "registry check failed: "+err.Error()
-		e.log.Warn().Err(err).Str("container", t.name).Msg("registry check failed")
+		// Common and non-fatal (locally-built images have no registry); keep it
+		// out of the warn stream — the detail is at debug and in `status`.
+		p.action, p.reason = ActionSkip, "registry unreachable"
+		e.log.Debug().Err(err).Str("container", t.name).Msg("registry check failed")
 		return p
 	}
 	p.available = remote
@@ -317,7 +429,14 @@ func (e *Engine) evaluate(ctx context.Context, t target) plan {
 	if t.set.Soak != nil {
 		soak = *t.set.Soak
 	}
-	first := e.st.SeenAt(t.name, remote, time.Now())
+	var first time.Time
+	if record {
+		first = e.st.SeenAt(t.name, remote, time.Now())
+	} else if t0, ok := e.st.PeekSeen(t.name, remote); ok {
+		first = t0
+	} else {
+		first = time.Now() // not yet tracked; show the full soak as remaining
+	}
 	if elapsed := time.Since(first); elapsed < soak {
 		p.action, p.reason = ActionSoaking, "within soak window"
 		p.soakLeft = soak - elapsed
@@ -371,8 +490,13 @@ func (e *Engine) apply(ctx context.Context, p plan) error {
 	e.log.Info().Str("container", p.name).Str("image", p.image).
 		Str("from", short(p.current)).Str("to", short(p.available)).Msg("updating")
 
-	// 1. Pull the new image fully BEFORE touching the running container.
-	if err := e.pull(ctx, p.image); err != nil {
+	// 1. Pull the new image fully BEFORE touching the running container. Bound it
+	// so a slow/throttled registry can't stall the whole daemon (it holds the
+	// single-flight lock) indefinitely.
+	pullCtx, cancelPull := context.WithTimeout(ctx, 10*time.Minute)
+	err := e.pull(pullCtx, p.image)
+	cancelPull()
+	if err != nil {
 		return fmt.Errorf("pull: %w", err)
 	}
 
@@ -380,8 +504,18 @@ func (e *Engine) apply(ctx context.Context, p plan) error {
 	// renamed, the sequence MUST complete (or roll back) even if the daemon is
 	// asked to shut down. Detach from ctx cancellation so a SIGTERM mid-recreate
 	// can't strand the container stopped-and-renamed. Interrupted recreates are
-	// also reconciled at the start of the next cycle (reconcileOrphans).
-	opCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Minute)
+	// also reconciled at the start of the next cycle (reconcileOrphans). Size the
+	// budget to the health-gate window so a long io.pullpilot.health-timeout
+	// can't be cut short and force a spurious rollback.
+	healthTimeout := 90 * time.Second
+	if p.settings.HealthTimeout != nil {
+		healthTimeout = *p.settings.HealthTimeout
+	}
+	opTimeout := healthTimeout + 2*time.Minute
+	if opTimeout < 5*time.Minute {
+		opTimeout = 5 * time.Minute
+	}
+	opCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), opTimeout)
 	defer cancel()
 
 	oldName := p.name
@@ -477,6 +611,9 @@ func (e *Engine) rollback(ctx context.Context, p plan, tmpName, newID string) {
 	}
 	if err := e.cli.ContainerRename(ctx, tmpName, p.name); err != nil {
 		e.log.Error().Err(err).Str("container", p.name).Msg("rollback rename failed — manual intervention may be needed")
+		e.note.Notify(ctx, "ACTION NEEDED: "+p.name+" may be down",
+			fmt.Sprintf("PullPilot could not restore %s after a failed update (%v). "+
+				"Check for a container named %s_pp_old and recover it manually.", p.name, err, p.name))
 		return
 	}
 	if p.running {

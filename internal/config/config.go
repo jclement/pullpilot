@@ -68,6 +68,19 @@ func Load() (*Config, error) {
 		return def
 	}
 
+	// Catch typo'd PP_* vars (otherwise silently ignored).
+	known := map[string]bool{
+		"PP_SCHEDULE": true, "PP_TIMEZONE": true, "PP_JITTER": true, "PP_SCOPE": true,
+		"PP_SOAK": true, "PP_SELF_UPDATE": true, "PP_CLEANUP": true, "PP_WEBHOOK": true,
+		"PP_WEBHOOK_URL": true, "PP_DATA_DIR": true, "PP_NOTIFY_URL": true, "PP_DRY_RUN": true,
+		"PP_LOG_LEVEL": true, "PP_LOG_JSON": true, "PP_COMPAT_WATCHTOWER": true,
+	}
+	for _, kv := range os.Environ() {
+		if k, _, _ := strings.Cut(kv, "="); strings.HasPrefix(k, "PP_") && !known[k] {
+			warnings = append(warnings, fmt.Sprintf("unknown env var %s (typo?) — ignored", k))
+		}
+	}
+
 	c := &Config{
 		Schedule:         env("PP_SCHEDULE", "0 3 * * *"),
 		Timezone:         env("PP_TIMEZONE", env("TZ", "UTC")),
