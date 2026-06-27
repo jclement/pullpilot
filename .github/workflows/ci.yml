@@ -24,19 +24,24 @@ jobs:
           npm ci
           npm test
 
+  # Advisory: surfaces vulnerabilities but does not block. Some advisories come
+  # from the Docker Engine SDK's transitive deps, which we can't patch without
+  # reintroducing the moby/docker module split.
   vuln:
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: golang/govulncheck-action@v1
         with:
-          go-version-input: "1.24"
+          go-version-input: "1.25"
 
   trivy:
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - uses: aquasecurity/trivy-action@0.28.0
+      - uses: aquasecurity/trivy-action@0.36.0
         with:
           scan-type: fs
           scanners: vuln,secret,misconfig

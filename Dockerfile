@@ -1,6 +1,6 @@
 # Optional Dockerfile for `docker build`. CI/releases use ko (see .ko.yaml /
 # .goreleaser.yaml) which produces the published multi-arch images.
-FROM golang:1.24 AS build
+FROM golang:1.25 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
