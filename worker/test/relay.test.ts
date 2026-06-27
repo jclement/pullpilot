@@ -297,3 +297,26 @@ describe("poke delivery", () => {
     expect(await res.json()).toEqual({ status: "accepted" });
   });
 });
+
+describe("unauthed socket reaping (DoS guard)", () => {
+  it("rejects unauthed sockets past the cap with 1013", async () => {
+    const p = await provision();
+    const MAX_UNAUTHED_SOCKETS = 8;
+
+    // Open the cap's worth of unauthed sockets and keep them parked.
+    const parked: WebSocket[] = [];
+    for (let i = 0; i < MAX_UNAUTHED_SOCKETS; i++) {
+      const ws = await openListen(p.listenUrl);
+      const hello = await nextMessage(ws);
+      expect(hello.type).toBe("hello");
+      parked.push(ws);
+    }
+
+    // The next unauthed socket must be rejected with the too-many code (1013).
+    const overflow = await openListen(p.listenUrl);
+    const code = await nextClose(overflow);
+    expect(code).toBe(1013); // CLOSE_TOO_MANY
+
+    for (const ws of parked) ws.close();
+  });
+});

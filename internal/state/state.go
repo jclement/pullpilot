@@ -5,6 +5,7 @@ package state
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -23,6 +24,9 @@ type State struct {
 	BadDigests map[string]bool `json:"bad_digests"`
 	// LastApplied maps container key -> digest last successfully applied.
 	LastApplied map[string]string `json:"last_applied"`
+	// Notified records "container/digest" pairs already announced, so a soaking
+	// or monitor-only update is notified once per new digest, not every cycle.
+	Notified map[string]bool `json:"notified"`
 }
 
 // Load reads state from dir/state.json, returning an empty state if absent.
@@ -32,6 +36,7 @@ func Load(dir string) (*State, error) {
 		FirstSeen:   map[string]time.Time{},
 		BadDigests:  map[string]bool{},
 		LastApplied: map[string]string{},
+		Notified:    map[string]bool{},
 	}
 	data, err := os.ReadFile(s.path)
 	if err != nil {
@@ -40,7 +45,12 @@ func Load(dir string) (*State, error) {
 		}
 		return nil, err
 	}
-	_ = json.Unmarshal(data, s)
+	if err := json.Unmarshal(data, s); err != nil {
+		// Corrupt state would otherwise silently reset all soak/bad-digest
+		// bookkeeping; surface it and back the bad file up rather than discard.
+		_ = os.Rename(s.path, s.path+".corrupt")
+		return nil, fmt.Errorf("state.json is corrupt (backed up to %s.corrupt): %w", s.path, err)
+	}
 	if s.FirstSeen == nil {
 		s.FirstSeen = map[string]time.Time{}
 	}
@@ -50,7 +60,24 @@ func Load(dir string) (*State, error) {
 	if s.LastApplied == nil {
 		s.LastApplied = map[string]string{}
 	}
+	if s.Notified == nil {
+		s.Notified = map[string]bool{}
+	}
 	return s, nil
+}
+
+// FirstNotify reports whether this is the first notification for a given
+// container/digest, recording it so repeated cycles don't re-notify.
+func (s *State) FirstNotify(key, digest string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := key + "/" + digest
+	if s.Notified[k] {
+		return false
+	}
+	s.Notified[k] = true
+	_ = s.save()
+	return true
 }
 
 func (s *State) save() error {

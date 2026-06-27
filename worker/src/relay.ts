@@ -9,8 +9,11 @@
  *   - The challenge/response auth handshake (ed25519 over a fixed domain).
  *   - Poke delivery to authed sockets, with 5s coalescing.
  *   - A single coalesced "pending poke" flag for when no listener is connected.
- *   - A weekly alarm that refreshes KV TTL while a listener is authed and
- *     reaps never-authed sockets older than 30s.
+ *   - A weekly alarm that refreshes KV TTL while a listener is authed, plus a
+ *     short-fused (30s) variant that reaps never-authed sockets. Opening a
+ *     socket lowers the alarm to fire within the reap window, and a small cap
+ *     bounds concurrent unauthed sockets so a known webhookId can't be used to
+ *     hold open unbounded connections that never authenticate.
  *
  * Storage uses the SQLite-backed Durable Object storage API (configured via
  * `new_sqlite_classes` in wrangler.toml). We use the simple key/value methods
@@ -37,6 +40,13 @@ const CHALLENGE_TTL_SECONDS = 30;
 
 /** Max simultaneously-authed sockets per webhook. Extras get close 1013. */
 const MAX_AUTHED_SOCKETS = 4;
+
+/**
+ * Max simultaneously-unauthed (handshake-pending) sockets per webhook. Extras
+ * get close 1013. Caps DoS via unbounded never-authenticating connections that
+ * would otherwise persist until the reaper alarm fires.
+ */
+const MAX_UNAUTHED_SOCKETS = 8;
 
 /** Coalesce pokes arriving within this many milliseconds into one delivery. */
 const POKE_COALESCE_MS = 5_000;
@@ -145,7 +155,7 @@ export class WebhookRelay extends DurableObject<Env> {
     this.webhookId = match ? match[1] : null;
 
     if (request.headers.get("Upgrade") === "websocket") {
-      return this.handleUpgrade();
+      return await this.handleUpgrade();
     }
     return this.handlePoke(request);
   }
@@ -155,9 +165,25 @@ export class WebhookRelay extends DurableObject<Env> {
   // -------------------------------------------------------------------------
 
   /** Accept a hibernatable WebSocket and send the `hello` challenge. */
-  private handleUpgrade(): Response {
+  private async handleUpgrade(): Promise<Response> {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
+
+    // Cap concurrent unauthed (handshake-pending) sockets. Without this an
+    // attacker who knows a webhookId could open unbounded connections that
+    // never authenticate and would only be reaped by the next alarm. We accept
+    // the socket so we can send a close frame, then close it with 1013.
+    const unauthedCount = this.ctx
+      .getWebSockets()
+      .filter((s) => {
+        const a = s.deserializeAttachment() as SocketAttachment | null;
+        return a?.authed !== true;
+      }).length;
+    if (unauthedCount >= MAX_UNAUTHED_SOCKETS) {
+      this.ctx.acceptWebSocket(server);
+      server.close(CLOSE_TOO_MANY, "too many connections");
+      return new Response(null, { status: 101, webSocket: client });
+    }
 
     // Accept with hibernation. The runtime keeps the client connected while
     // this DO sleeps; webSocketMessage/Close re-wake it as needed.
@@ -184,9 +210,10 @@ export class WebhookRelay extends DurableObject<Env> {
       }),
     );
 
-    // Ensure the reaper alarm is scheduled so stale unauthed sockets get
-    // cleaned up and active webhooks keep their KV TTL fresh.
-    void this.ensureAlarm();
+    // Schedule the reaper alarm to fire soon so this never-authed socket gets
+    // cleaned up if the handshake doesn't complete. We lower (never raise) any
+    // existing alarm so the weekly KV-refresh cadence doesn't delay reaping.
+    await this.scheduleReaperAlarm();
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -443,11 +470,17 @@ export class WebhookRelay extends DurableObject<Env> {
   // Alarm: weekly KV TTL refresh + stale unauthed-socket reaper
   // -------------------------------------------------------------------------
 
-  /** Schedule the alarm if one is not already pending. */
-  private async ensureAlarm(): Promise<void> {
+  /**
+   * Schedule the reaper alarm to fire soon (within UNAUTHED_MAX_AGE_MS) so a
+   * freshly-opened unauthed socket gets reaped if it never authenticates. We
+   * only ever LOWER an existing alarm: if the weekly KV-refresh alarm (or an
+   * earlier reaper alarm) is already pending sooner, we leave it untouched.
+   */
+  private async scheduleReaperAlarm(): Promise<void> {
+    const target = Date.now() + UNAUTHED_MAX_AGE_MS;
     const existing = await this.ctx.storage.getAlarm();
-    if (existing === null) {
-      await this.ctx.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
+    if (existing === null || target < existing) {
+      await this.ctx.storage.setAlarm(target);
     }
   }
 
@@ -456,6 +489,7 @@ export class WebhookRelay extends DurableObject<Env> {
     const sockets = this.ctx.getWebSockets();
 
     let hasAuthed = false;
+    let hasUnauthed = false;
     for (const s of sockets) {
       const a = s.deserializeAttachment() as SocketAttachment | null;
       if (!a) continue;
@@ -468,6 +502,9 @@ export class WebhookRelay extends DurableObject<Env> {
         } catch {
           // already closing
         }
+      } else {
+        // Still within its grace window — keep the reaper running for it.
+        hasUnauthed = true;
       }
     }
 
@@ -476,8 +513,13 @@ export class WebhookRelay extends DurableObject<Env> {
       await this.touchRecord(this.webhookId);
     }
 
-    // Reschedule only while sockets remain; otherwise let the DO go idle.
-    if (this.ctx.getWebSockets().length > 0) {
+    // Reschedule based on what's left:
+    //   - any unauthed socket still pending: reap again soon (30s),
+    //   - else any authed socket: keep the weekly KV-refresh cadence,
+    //   - else nothing connected: let the DO go idle (no alarm).
+    if (hasUnauthed) {
+      await this.ctx.storage.setAlarm(now + UNAUTHED_MAX_AGE_MS);
+    } else if (hasAuthed) {
       await this.ctx.storage.setAlarm(now + ALARM_INTERVAL_MS);
     }
   }

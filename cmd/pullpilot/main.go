@@ -136,5 +136,15 @@ func serve(once bool) error {
 	log.Info().Str("schedule", cfg.Schedule).Str("tz", cfg.Timezone).Msg("daemon ready")
 	<-ctx.Done()
 	log.Info().Msg("shutting down")
+
+	// Give an in-flight update a moment to finish cleanly; any recreate that is
+	// still interrupted is reconciled on the next start.
+	done := make(chan struct{})
+	go func() { mu.Lock(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		log.Warn().Msg("shutdown timed out waiting for an in-flight update")
+	}
 	return nil
 }

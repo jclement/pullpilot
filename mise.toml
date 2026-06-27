@@ -1,6 +1,7 @@
 [tools]
-go = "1.25"
+go = "1.26"
 node = "22"
+goreleaser = "2"
 "npm:wrangler" = "4"
 
 [env]

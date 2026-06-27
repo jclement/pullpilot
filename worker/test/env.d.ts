@@ -4,11 +4,17 @@
  * - Pulls in the `cloudflare:test` module declarations shipped by
  *   @cloudflare/vitest-pool-workers (provides `env`, `SELF`, `runInDurableObject`,
  *   etc.).
- * - Extends `ProvidedEnv` so `env` is typed with our Worker's bindings.
+ * - Extends the global `Cloudflare.Env` so `env` is typed with our Worker's
+ *   bindings. As of vitest-pool-workers 0.16 (vitest 4), `cloudflare:test`
+ *   types `env` as `Cloudflare.Env` rather than an augmentable `ProvidedEnv`.
  */
-/// <reference types="@cloudflare/vitest-pool-workers" />
-import type { Env } from "../src/index";
+/// <reference types="@cloudflare/vitest-pool-workers/types" />
+import type { Env as WorkerEnv } from "../src/index";
 
-declare module "cloudflare:test" {
-  interface ProvidedEnv extends Env {}
+declare global {
+  namespace Cloudflare {
+    interface Env extends WorkerEnv {}
+  }
 }
+
+export {};

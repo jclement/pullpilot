@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,7 +15,7 @@ import (
 
 // Scope selects which containers PullPilot manages.
 type Scope struct {
-	Mode    string // "project" | "all" | "project"
+	Mode    string // "project" | "all"
 	Project string // explicit project name for "project:<name>"
 }
 
@@ -35,25 +36,54 @@ type Config struct {
 	LogLevel         string
 	LogJSON          bool
 	CompatWatchtower bool
+
+	// Warnings collects non-fatal config problems (e.g. an unparseable value
+	// that fell back to a default), surfaced in the boot summary.
+	Warnings []string
 }
 
 // Load reads configuration from the environment, applying defaults.
 func Load() (*Config, error) {
+	var warnings []string
+	durOf := func(key string, def time.Duration) time.Duration {
+		v, ok := os.LookupEnv(key)
+		if !ok || v == "" {
+			return def
+		}
+		if d, ok := parseDuration(v); ok {
+			return d
+		}
+		warnings = append(warnings, fmt.Sprintf("%s=%q is not a valid duration; using %s", key, v, def))
+		return def
+	}
+	boolOf := func(key string, def bool) bool {
+		v, ok := os.LookupEnv(key)
+		if !ok || v == "" {
+			return def
+		}
+		if b, ok := parseBool(v); ok {
+			return b
+		}
+		warnings = append(warnings, fmt.Sprintf("%s=%q is not a valid boolean; using %v", key, v, def))
+		return def
+	}
+
 	c := &Config{
 		Schedule:         env("PP_SCHEDULE", "0 3 * * *"),
 		Timezone:         env("PP_TIMEZONE", env("TZ", "UTC")),
-		Jitter:           dur("PP_JITTER", 30*time.Minute),
-		Soak:             dur("PP_SOAK", 24*time.Hour),
-		SelfUpdate:       boolean("PP_SELF_UPDATE", false),
-		Cleanup:          boolean("PP_CLEANUP", false),
-		Webhook:          boolean("PP_WEBHOOK", false),
+		Jitter:           durOf("PP_JITTER", 30*time.Minute),
+		Soak:             durOf("PP_SOAK", 24*time.Hour),
+		SelfUpdate:       boolOf("PP_SELF_UPDATE", false),
+		Cleanup:          boolOf("PP_CLEANUP", false),
+		Webhook:          boolOf("PP_WEBHOOK", false),
 		WebhookURL:       env("PP_WEBHOOK_URL", version.DefaultWebhookURL),
 		DataDir:          env("PP_DATA_DIR", "/data"),
 		NotifyURL:        env("PP_NOTIFY_URL", ""),
-		DryRun:           boolean("PP_DRY_RUN", false),
+		DryRun:           boolOf("PP_DRY_RUN", false),
 		LogLevel:         env("PP_LOG_LEVEL", "info"),
-		LogJSON:          boolean("PP_LOG_JSON", false),
-		CompatWatchtower: boolean("PP_COMPAT_WATCHTOWER", false),
+		LogJSON:          boolOf("PP_LOG_JSON", false),
+		CompatWatchtower: boolOf("PP_COMPAT_WATCHTOWER", false),
+		Warnings:         warnings,
 	}
 
 	scope := env("PP_SCOPE", "project")
@@ -105,6 +135,9 @@ func (c *Config) LogSummary(log zerolog.Logger) {
 		Bool("notify", c.NotifyURL != "").
 		Bool("dry_run", c.DryRun).
 		Msg("pullpilot starting")
+	for _, w := range c.Warnings {
+		log.Warn().Msg("config: " + w)
+	}
 }
 
 // redactURL shows the relay host but never a full (secret-bearing) webhook URL.
@@ -153,28 +186,26 @@ func env(key, def string) string {
 	return def
 }
 
-func boolean(key string, def bool) bool {
-	v, ok := os.LookupEnv(key)
-	if !ok || v == "" {
-		return def
-	}
+// parseBool reports the parsed value and whether it was a recognized boolean.
+func parseBool(v string) (bool, bool) {
 	switch strings.ToLower(strings.TrimSpace(v)) {
 	case "1", "true", "yes", "on", "y":
-		return true
+		return true, true
 	case "0", "false", "no", "off", "n":
-		return false
+		return false, true
 	}
-	return def
+	return false, false
 }
 
-func dur(key string, def time.Duration) time.Duration {
-	v, ok := os.LookupEnv(key)
-	if !ok || v == "" {
-		return def
+// parseDuration accepts Go durations ("24h", "30m") and, like the label parser,
+// a bare integer as seconds. The second return reports whether it parsed.
+func parseDuration(v string) (time.Duration, bool) {
+	v = strings.TrimSpace(v)
+	if d, err := time.ParseDuration(v); err == nil {
+		return d, true
 	}
-	d, err := time.ParseDuration(strings.TrimSpace(v))
-	if err != nil {
-		return def
+	if n, err := strconv.Atoi(v); err == nil {
+		return time.Duration(n) * time.Second, true
 	}
-	return d
+	return 0, false
 }

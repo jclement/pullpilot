@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	mrand "math/rand/v2"
@@ -42,6 +43,9 @@ type Client struct {
 	pub       ed25519.PublicKey
 	webhookID string
 	listenURL string
+
+	mu           sync.Mutex
+	pendingTimer *time.Timer
 }
 
 type registration struct {
@@ -72,6 +76,13 @@ func (c *Client) keyPath() string { return filepath.Join(c.dataDir, "ed25519.key
 func (c *Client) regPath() string { return filepath.Join(c.dataDir, "webhook.json") }
 
 func (c *Client) loadOrCreateKey() error {
+	// Always ensure the data dir exists and is private, even if it was created
+	// (possibly world-readable) by the volume mount or an earlier component.
+	if err := os.MkdirAll(c.dataDir, 0o700); err != nil {
+		return err
+	}
+	_ = os.Chmod(c.dataDir, 0o700)
+
 	if data, err := os.ReadFile(c.keyPath()); err == nil && len(data) == ed25519.SeedSize {
 		c.priv = ed25519.NewKeyFromSeed(data)
 		c.pub = c.priv.Public().(ed25519.PublicKey)
@@ -79,9 +90,6 @@ func (c *Client) loadOrCreateKey() error {
 	}
 	seed := make([]byte, ed25519.SeedSize)
 	if _, err := rand.Read(seed); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(c.dataDir, 0o700); err != nil {
 		return err
 	}
 	if err := os.WriteFile(c.keyPath(), seed, 0o600); err != nil {
@@ -141,16 +149,16 @@ func (c *Client) provision() error {
 
 // Run holds the connection, reconnecting with full-jitter backoff until ctx ends.
 func (c *Client) Run(ctx context.Context) {
+	defer c.stopPending()
 	const base, cap = time.Second, 60 * time.Second
 	attempt := 0
 	for ctx.Err() == nil {
-		connectedAt := time.Now()
-		err := c.connectAndListen(ctx)
+		authedAt, err := c.connectAndListen(ctx)
 		if ctx.Err() != nil {
 			return
 		}
-		if time.Since(connectedAt) > 60*time.Second {
-			attempt = 0 // stable session; reset backoff
+		if !authedAt.IsZero() && time.Since(authedAt) > 60*time.Second {
+			attempt = 0 // stable authed session; reset backoff
 		}
 		backoff := time.Duration(float64(base) * float64(int64(1)<<min(attempt, 6)))
 		if backoff > cap {
@@ -177,12 +185,15 @@ type frame struct {
 	Reason    string `json:"reason,omitempty"`
 }
 
-func (c *Client) connectAndListen(ctx context.Context) error {
+// connectAndListen dials, authenticates, and pumps pokes until the connection
+// fails. authedAt is the instant auth succeeded (zero if it never did), used by
+// Run to reset backoff only after a genuinely stable session.
+func (c *Client) connectAndListen(ctx context.Context) (authedAt time.Time, err error) {
 	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	conn, _, err := websocket.Dial(dialCtx, c.listenURL, nil)
 	cancel()
 	if err != nil {
-		return fmt.Errorf("dial: %w", err)
+		return time.Time{}, fmt.Errorf("dial: %w", err)
 	}
 	conn.SetReadLimit(64 * 1024)
 	defer conn.CloseNow()
@@ -190,28 +201,29 @@ func (c *Client) connectAndListen(ctx context.Context) error {
 	// Handshake: hello -> auth -> ready.
 	hello, err := c.read(ctx, conn)
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
 	if hello.Type != "hello" {
-		return fmt.Errorf("expected hello, got %q", hello.Type)
+		return time.Time{}, fmt.Errorf("expected hello, got %q", hello.Type)
 	}
 	chal, err := base64.RawURLEncoding.DecodeString(hello.Challenge)
 	if err != nil {
-		return fmt.Errorf("bad challenge: %w", err)
+		return time.Time{}, fmt.Errorf("bad challenge: %w", err)
 	}
 	msg := append([]byte(domain), []byte(c.webhookID)...)
 	msg = append(msg, chal...)
 	sig := ed25519.Sign(c.priv, msg)
 	if err := c.write(ctx, conn, frame{Type: "auth", Sig: base64.RawURLEncoding.EncodeToString(sig)}); err != nil {
-		return err
+		return time.Time{}, err
 	}
 	ready, err := c.read(ctx, conn)
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
 	if ready.Type != "ready" {
-		return fmt.Errorf("auth rejected (got %q)", ready.Type)
+		return time.Time{}, fmt.Errorf("auth rejected (got %q)", ready.Type)
 	}
+	authedAt = time.Now()
 	c.log.Info().Str("poke_url", c.PokeURL()).Msg("relay connected")
 
 	// Heartbeat.
@@ -223,7 +235,7 @@ func (c *Client) connectAndListen(ctx context.Context) error {
 	for {
 		f, err := c.read(ctx, conn)
 		if err != nil {
-			return err
+			return authedAt, err
 		}
 		if f.Type == "poke" {
 			c.log.Debug().Str("id", f.ID).Str("reason", f.Reason).Msg("poke received")
@@ -241,28 +253,47 @@ func (c *Client) heartbeat(ctx context.Context, conn *websocket.Conn) {
 			return
 		case <-t.C:
 			wc, cancel := context.WithTimeout(ctx, 10*time.Second)
-			_ = conn.Write(wc, websocket.MessageText, []byte("ping"))
+			err := conn.Write(wc, websocket.MessageText, []byte("ping"))
 			cancel()
+			if err != nil {
+				// A failed heartbeat write means the link is dead; close now so
+				// the receive loop unblocks immediately instead of waiting out
+				// the read deadline.
+				_ = conn.CloseNow()
+				return
+			}
 		}
 	}
 }
 
 // schedule debounces pokes into a single trigger.
-var pendingTimer *time.Timer
-
 func (c *Client) schedule(reason string) {
-	if pendingTimer != nil {
-		pendingTimer.Stop()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pendingTimer != nil {
+		c.pendingTimer.Stop()
 	}
 	r := reason
 	if r == "" {
 		r = "webhook"
 	}
-	pendingTimer = time.AfterFunc(debounce, func() { c.trigger(r) })
+	c.pendingTimer = time.AfterFunc(debounce, func() { c.trigger(r) })
+}
+
+// stopPending cancels any debounced trigger (called on shutdown).
+func (c *Client) stopPending() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pendingTimer != nil {
+		c.pendingTimer.Stop()
+	}
 }
 
 func (c *Client) read(ctx context.Context, conn *websocket.Conn) (frame, error) {
-	rc, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	// Just over two heartbeat intervals: pongs reset this every 30s on a healthy
+	// link, so it never trips normally but detects a silently-dropped (NAT) link
+	// in ~90s instead of minutes.
+	rc, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	typ, data, err := conn.Read(rc)
 	if err != nil {

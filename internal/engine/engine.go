@@ -5,6 +5,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -114,6 +115,9 @@ func (e *Engine) Run(ctx context.Context, trigger string) {
 	start := time.Now()
 	e.log.Info().Str("trigger", trigger).Str("scope", e.scopeLabel()).Msg("update cycle starting")
 
+	// Heal any container left half-recreated by an interrupted previous cycle.
+	e.reconcileOrphans(ctx)
+
 	targets, err := e.discover(ctx)
 	if err != nil {
 		e.log.Error().Err(err).Msg("discovery failed")
@@ -154,14 +158,19 @@ func (e *Engine) Run(ctx context.Context, trigger string) {
 			e.log.Info().Str("container", p.name).Str("image", p.image).
 				Str("to", short(p.available)).Dur("soak_left", p.soakLeft.Round(time.Minute)).
 				Msg("new image detected, soaking")
-			e.note.Notify(ctx, "Update soaking: "+p.name,
-				fmt.Sprintf("%s has a new image (%s); rolling out in %s unless stopped.",
-					p.name, short(p.available), p.soakLeft.Round(time.Minute)))
+			// Notify once per new digest, not every cycle.
+			if e.st.FirstNotify(p.name, p.available) {
+				e.note.Notify(ctx, "Update soaking: "+p.name,
+					fmt.Sprintf("%s has a new image (%s); rolling out in %s unless stopped.",
+						p.name, short(p.available), p.soakLeft.Round(time.Minute)))
+			}
 		case ActionMonitor:
 			e.log.Info().Str("container", p.name).Str("to", short(p.available)).
-				Msg("update available (monitor-only)")
-			e.note.Notify(ctx, "Update available: "+p.name,
-				fmt.Sprintf("%s has a new image (%s). monitor-only — not applied.", p.name, short(p.available)))
+				Str("reason", p.reason).Msg("update available (monitor-only)")
+			if e.st.FirstNotify(p.name, p.available) {
+				e.note.Notify(ctx, "Update available: "+p.name,
+					fmt.Sprintf("%s has a new image (%s). %s — not applied.", p.name, short(p.available), p.reason))
+			}
 		default:
 			e.log.Debug().Str("container", p.name).Str("action", string(p.action)).
 				Str("reason", p.reason).Msg("no action")
@@ -231,7 +240,7 @@ func (e *Engine) discover(ctx context.Context) ([]target, error) {
 // eligible applies scope and label opt-in/opt-out rules.
 func (e *Engine) eligible(id string, set labels.Settings) bool {
 	if id == e.selfID && !e.cfg.SelfUpdate {
-		return false // self handled separately / disabled
+		return false // PullPilot's own container; only considered when self-update is enabled
 	}
 	if set.Oneoff || set.Exclude {
 		return false
@@ -286,6 +295,14 @@ func (e *Engine) evaluate(ctx context.Context, t target) plan {
 		p.action, p.reason = ActionUpToDate, "current"
 		return p
 	}
+	if t.id == e.selfID {
+		// A real self-update would have to stop/recreate the very container this
+		// process runs in, killing the daemon mid-apply. Until an out-of-band
+		// orchestrator handoff is implemented, surface self-updates as a
+		// notification only — never apply them in-place.
+		p.action, p.reason = ActionMonitor, "self-update available (notify only)"
+		return p
+	}
 	if e.st.IsBad(remote) {
 		p.action, p.reason = ActionSkip, "digest previously failed health check"
 		return p
@@ -337,8 +354,13 @@ func matchRepoDigest(image string, repoDigests []string) string {
 			}
 		}
 	}
-	if _, dg, ok := strings.Cut(repoDigests[0], "@"); ok {
-		return dg
+	// Only fall back to the sole digest when the image is under exactly one
+	// repository; a blind [0] across multiple repos could compare against an
+	// unrelated repository and report perpetual "newer image".
+	if len(repoDigests) == 1 {
+		if _, dg, ok := strings.Cut(repoDigests[0], "@"); ok {
+			return dg
+		}
 	}
 	return ""
 }
@@ -354,6 +376,14 @@ func (e *Engine) apply(ctx context.Context, p plan) error {
 		return fmt.Errorf("pull: %w", err)
 	}
 
+	// The recreate is a critical section: once the old container is stopped and
+	// renamed, the sequence MUST complete (or roll back) even if the daemon is
+	// asked to shut down. Detach from ctx cancellation so a SIGTERM mid-recreate
+	// can't strand the container stopped-and-renamed. Interrupted recreates are
+	// also reconciled at the start of the next cycle (reconcileOrphans).
+	opCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Minute)
+	defer cancel()
+
 	oldName := p.name
 	tmpName := p.name + "_pp_old"
 	insp := p.inspect
@@ -365,60 +395,76 @@ func (e *Engine) apply(ctx context.Context, p plan) error {
 		stopTimeout = &s
 	}
 	if p.running {
-		if err := e.cli.ContainerStop(ctx, p.id, container.StopOptions{Timeout: stopTimeout}); err != nil {
+		if err := e.cli.ContainerStop(opCtx, p.id, container.StopOptions{Timeout: stopTimeout}); err != nil {
 			return fmt.Errorf("stop old: %w", err)
 		}
 	}
-	if err := e.cli.ContainerRename(ctx, p.id, tmpName); err != nil {
+	if err := e.cli.ContainerRename(opCtx, p.id, tmpName); err != nil {
 		return fmt.Errorf("rename old: %w", err)
 	}
 
 	// 3. Create the replacement from the old container's config + new image.
 	cfg := *insp.Config
 	cfg.Image = p.image
+	// Docker sets Config.Hostname to the container's short ID when no hostname
+	// was given; reusing it verbatim would give the new container the OLD id as
+	// its hostname, breaking PullPilot's own hostname-prefix self-identification
+	// after a recreate. Clear it in that case so Docker assigns the new id.
+	if cfg.Hostname != "" && strings.HasPrefix(p.id, cfg.Hostname) {
+		cfg.Hostname = ""
+	}
 	hostCfg := insp.HostConfig
 	netCfg, extraNets := buildNetworking(insp.NetworkSettings)
 
-	created, err := e.cli.ContainerCreate(ctx, &cfg, hostCfg, netCfg, nil, oldName)
+	created, err := e.cli.ContainerCreate(opCtx, &cfg, hostCfg, netCfg, nil, oldName)
 	if err != nil {
 		// Recreate failed: restore the old container.
-		e.rollback(ctx, p, tmpName, "")
+		e.rollback(opCtx, p, tmpName, "")
 		return fmt.Errorf("create new: %w", err)
 	}
 
-	// 4. Attach any additional networks (create reliably attaches only one).
+	// 4. Attach any additional networks (create reliably attaches only one). A
+	// failure here means the container would go live with degraded connectivity,
+	// so roll back rather than delete the working old container.
 	for name, ep := range extraNets {
-		if err := e.cli.NetworkConnect(ctx, name, created.ID, ep); err != nil {
-			e.log.Warn().Err(err).Str("network", name).Msg("attach extra network failed")
+		if err := e.cli.NetworkConnect(opCtx, name, created.ID, ep); err != nil {
+			e.rollback(opCtx, p, tmpName, created.ID)
+			return fmt.Errorf("attach network %s: %w", name, err)
 		}
 	}
 
 	// 5. Start (only if the old one was running) and health-gate.
 	if p.running {
-		if err := e.cli.ContainerStart(ctx, created.ID, container.StartOptions{}); err != nil {
-			e.rollback(ctx, p, tmpName, created.ID)
+		if err := e.cli.ContainerStart(opCtx, created.ID, container.StartOptions{}); err != nil {
+			e.rollback(opCtx, p, tmpName, created.ID)
 			return fmt.Errorf("start new: %w", err)
 		}
-		if err := e.healthGate(ctx, created.ID, p.settings); err != nil {
-			e.st.MarkBad(p.available)
-			e.rollback(ctx, p, tmpName, created.ID)
-			e.note.Notify(ctx, "Update rolled back: "+p.name,
+		if err := e.healthGate(opCtx, created.ID, p.settings); err != nil {
+			// A genuine unhealthy/exited/restart-loop verdict blacklists the
+			// digest so it is never auto-retried. An interrupted gate (timeout or
+			// cancellation) must NOT permanently reject an otherwise-good image.
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				e.st.MarkBad(p.available)
+			}
+			e.rollback(opCtx, p, tmpName, created.ID)
+			e.note.Notify(opCtx, "Update rolled back: "+p.name,
 				fmt.Sprintf("%s failed health check on %s and was rolled back to %s.",
 					p.name, short(p.available), short(p.current)))
 			return fmt.Errorf("health gate: %w", err)
 		}
 	}
 
-	// 6. Success: remove the old container (keep its volumes) and record state.
-	_ = e.cli.ContainerRemove(ctx, tmpName, container.RemoveOptions{})
+	// 6. Success: remove the old container and record state. Anonymous volumes
+	// are preserved unless the container opts in via the label.
+	_ = e.cli.ContainerRemove(opCtx, tmpName, container.RemoveOptions{RemoveVolumes: p.settings.RemoveAnonVols})
 	e.st.MarkApplied(p.name, p.available)
 	if e.cfg.Cleanup {
-		if _, err := e.cli.ImageRemove(ctx, p.current, image.RemoveOptions{}); err != nil {
+		if _, err := e.cli.ImageRemove(opCtx, p.current, image.RemoveOptions{}); err != nil {
 			e.log.Debug().Err(err).Msg("old image cleanup skipped (still in use?)")
 		}
 	}
 	e.log.Info().Str("container", p.name).Str("now", short(p.available)).Msg("updated and healthy")
-	e.note.Notify(ctx, "Updated: "+p.name,
+	e.note.Notify(opCtx, "Updated: "+p.name,
 		fmt.Sprintf("%s updated %s → %s and is healthy.", p.name, short(p.current), short(p.available)))
 	return nil
 }
@@ -439,6 +485,44 @@ func (e *Engine) rollback(ctx context.Context, p plan, tmpName, newID string) {
 		}
 	}
 	e.log.Warn().Str("container", p.name).Str("restored", short(p.current)).Msg("rolled back")
+}
+
+// reconcileOrphans heals containers left half-recreated by an interrupted
+// previous cycle (a leftover "<name>_pp_old"). If the replacement is in place,
+// the orphan is removed; otherwise the orphan is restored under its name.
+func (e *Engine) reconcileOrphans(ctx context.Context) {
+	list, err := e.cli.ContainerList(ctx, container.ListOptions{All: true})
+	if err != nil {
+		return
+	}
+	present := map[string]bool{}
+	for _, c := range list {
+		for _, n := range c.Names {
+			present[strings.TrimPrefix(n, "/")] = true
+		}
+	}
+	for _, c := range list {
+		for _, raw := range c.Names {
+			n := strings.TrimPrefix(raw, "/")
+			orig, ok := strings.CutSuffix(n, "_pp_old")
+			if !ok {
+				continue
+			}
+			if present[orig] {
+				// Replacement already exists; this is the superseded old container.
+				_ = e.cli.ContainerRemove(ctx, c.ID, container.RemoveOptions{})
+				e.log.Warn().Str("container", orig).Msg("removed orphaned _pp_old from an interrupted update")
+			} else {
+				// Interrupted before the replacement existed: restore the original.
+				if err := e.cli.ContainerRename(ctx, c.ID, orig); err != nil {
+					e.log.Error().Err(err).Str("container", orig).Msg("failed to restore interrupted update — manual intervention may be needed")
+					continue
+				}
+				_ = e.cli.ContainerStart(ctx, c.ID, container.StartOptions{})
+				e.log.Warn().Str("container", orig).Msg("restored container from an interrupted update")
+			}
+		}
+	}
 }
 
 // healthGate waits for the container to become healthy, or — when it has no
@@ -474,15 +558,13 @@ func (e *Engine) healthGate(ctx context.Context, id string, set labels.Settings)
 				return fmt.Errorf("container reported unhealthy")
 			}
 		} else {
-			// No healthcheck: require it to be running and not restart-looping.
+			// No healthcheck: best-effort crash-loop detection — require it to
+			// stay running and not restart-loop for the full window.
 			if !insp.State.Running {
 				return fmt.Errorf("container exited (%d)", insp.State.ExitCode)
 			}
 			if insp.RestartCount > startRestarts {
 				return fmt.Errorf("container is restart-looping")
-			}
-			if time.Now().After(deadline.Add(-timeout / 2)) {
-				return nil // stable for half the window with no healthcheck
 			}
 		}
 		if time.Now().After(deadline) {
@@ -525,19 +607,27 @@ func buildNetworking(ns *types.NetworkSettings) (*network.NetworkingConfig, map[
 	sort.Strings(names)
 	primary := names[0]
 	cfg := &network.NetworkingConfig{EndpointsConfig: map[string]*network.EndpointSettings{
-		primary: {Aliases: aliasesOf(ns.Networks[primary])},
+		primary: endpointFrom(ns.Networks[primary]),
 	}}
 	for _, n := range names[1:] {
-		extra[n] = &network.EndpointSettings{Aliases: aliasesOf(ns.Networks[n])}
+		extra[n] = endpointFrom(ns.Networks[n])
 	}
 	return cfg, extra
 }
 
-func aliasesOf(ep *network.EndpointSettings) []string {
+// endpointFrom carries forward the endpoint configuration that must survive a
+// recreate: aliases, static IPs (IPAMConfig), links and driver options. Runtime
+// fields (assigned IP, gateway, endpoint id) are intentionally not copied.
+func endpointFrom(ep *network.EndpointSettings) *network.EndpointSettings {
 	if ep == nil {
-		return nil
+		return &network.EndpointSettings{}
 	}
-	return ep.Aliases
+	return &network.EndpointSettings{
+		Aliases:    ep.Aliases,
+		Links:      ep.Links,
+		IPAMConfig: ep.IPAMConfig,
+		DriverOpts: ep.DriverOpts,
+	}
 }
 
 func short(digest string) string {

@@ -12,11 +12,14 @@ services:
   pullpilot:
     image: ghcr.io/jclement/pullpilot:stable
     environment:
-      DOCKER_HOST: tcp://docker-socket-proxy:2375
       PP_TIMEZONE: America/Edmonton
     volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
       - pullpilot-data:/data
-    # ... see deploy/docker-compose.example.yml for the hardened, full version
+    user: "0:0"                       # root, to access the docker socket
+    restart: unless-stopped
+volumes:
+  pullpilot-data:
 ```
 
 ---
@@ -30,8 +33,8 @@ services:
 | **Soak window** before rollout | ❌ | ✅ (default 24h) |
 | **Health-gated automatic rollback** | ❌ | ✅ |
 | Instant webhook updates (no inbound port) | ❌ | ✅ (Cloudflare relay) |
-| Runs non-root, read-only, socket-proxied | partial | ✅ by design |
 | Pull-before-stop (no downtime on failed pull) | ✅ | ✅ |
+| Self-heals an update interrupted by a reboot | ❌ | ✅ |
 
 PullPilot's safety doesn't depend on image signatures (almost no real-world
 images are signed). Instead it relies on three controls that work for **every**
@@ -65,8 +68,8 @@ On a schedule (and/or on a webhook poke), PullPilot:
 ## Quick start
 
 1. Copy [`deploy/docker-compose.example.yml`](deploy/docker-compose.example.yml)
-   into your stack (it includes a scoped Docker socket-proxy so PullPilot never
-   touches the raw socket).
+   into your stack — it mounts the Docker socket and adds cheap container
+   hardening (read-only rootfs, dropped capabilities, no-new-privileges).
 2. Adjust `PP_TIMEZONE` and bring it up:
 
    ```bash
@@ -105,9 +108,9 @@ compose file. Per-container tweaks are **labels** (`io.pullpilot.*`).
 | `PP_SCHEDULE` | `0 3 * * *` | Cron for the baseline poll (nightly 03:00). |
 | `PP_TIMEZONE` | host `TZ`, else `UTC` | e.g. `America/Edmonton`. |
 | `PP_JITTER` | `30m` | Random delay added to each scheduled run (spreads registry load). |
-| `PP_SCOPE` | `project` | `project` \| `all` \| `project:<name>`. |
-| `PP_SOAK` | `24h` | Soak window before a new digest rolls out. |
-| `PP_SELF_UPDATE` | `false` | Let PullPilot update its own container. |
+| `PP_SCOPE` | `project` | `project` \| `all` \| `project:<name>`. ⚠️ `all` manages every non-excluded container on the host. |
+| `PP_SOAK` | `24h` | Soak window before a new digest rolls out (bare integer = seconds). |
+| `PP_SELF_UPDATE` | `false` | Notify when a newer PullPilot image is available. (In-place self-update isn't supported yet — it would kill the daemon mid-update — so this is notify-only for now.) |
 | `PP_CLEANUP` | `false` | Remove old images after a healthy update. |
 | `PP_WEBHOOK` | `false` | Enable instant webhook trigger. |
 | `PP_WEBHOOK_URL` | baked default | Relay base URL (point at your own worker). |
@@ -174,8 +177,8 @@ trust root. Deploy your own:
 ```bash
 cd worker
 npm install
-wrangler kv namespace create REGISTRY            # paste id into wrangler.toml
-wrangler kv namespace create REGISTRY --env test  # paste test id into wrangler.toml
+wrangler kv namespace create PULLPILOT_REGISTRY        # paste id into wrangler.toml
+wrangler kv namespace create PULLPILOT_REGISTRY_TEST   # paste test id into wrangler.toml
 wrangler deploy --env production
 ```
 
@@ -185,22 +188,35 @@ Then set `PP_WEBHOOK_URL: https://pullpilot-relay.<your-subdomain>.workers.dev`.
 
 ## Security
 
-PullPilot defends several trust boundaries independently:
+**Be clear-eyed about the Docker socket.** PullPilot has to talk to the Docker
+API to recreate containers, and *anything* that can create a container can create
+a privileged one that mounts the host's root filesystem — i.e. **socket access is
+root-equivalent on the host.** This is the same risk profile as Watchtower and is
+inherent to auto-updating containers; no amount of wrapping removes it. The one
+control that genuinely changes the equation is **rootless Docker** — run it that
+way on sensitive hosts and "create a privileged container" no longer means host
+root. (A socket proxy that only allows certain endpoints is *not* a meaningful
+fix here: PullPilot needs container-create, which is already enough to escalate.)
 
-- **Relay ↔ daemon** — non-authoritative pokes, ed25519 listen auth, rate limits,
-  and a mandatory cron floor mean the relay can never force or fake an update.
-- **Registry ↔ daemon** — digest pinning, the soak window (a bad push gets caught
-  upstream before it reaches you), and health-gated rollback.
-- **Docker socket ↔ daemon** — reach Docker only through a **scoped socket-proxy**
-  on an internal network (no host port); run non-root, read-only rootfs,
-  `cap_drop: ALL`, `no-new-privileges`. Default scope is your own project.
-- **Data dir** — the ed25519 key is written `0600`; secrets are never logged and
-  full webhook URLs are redacted.
+What PullPilot *does* do well:
 
-> **Honest caveat:** any tool that recreates containers inherently has enough
-> Docker power to escalate to host root (it can create a privileged container).
-> The socket-proxy reduces incidental surface; **rootless Docker** is the real
-> mitigation for the host-root problem. Run it that way for sensitive hosts.
+- **No inbound ports.** The daemon never listens; the webhook-relay design exists
+  precisely so you don't expose anything. The only way in is compromising the
+  PullPilot image/process itself — so keep it pinned and trusted.
+- **The realistic threat is a bad upstream image, not the socket** — handled by
+  digest pinning, the **soak window** (a broken/malicious `:latest` is caught
+  upstream before it reaches you), and **health-gated rollback**.
+- **The relay is untrusted by design** — pokes are non-authoritative (they can
+  never name an image or skip a gate), the listen connection is ed25519
+  challenge-response authenticated, pokes are rate-limited, and a mandatory cron
+  floor means a hostile relay can't even suppress updates.
+- **Secrets** — the ed25519 key is written `0600` in a `0700` dir; secrets are
+  never logged and webhook URLs are redacted.
+- **Cheap container hardening** in the example (read-only rootfs, `cap_drop: ALL`,
+  `no-new-privileges`) limits in-container surface without adding complexity.
+
+Default scope is **your own compose project** — PullPilot won't touch anything
+else unless you opt into `PP_SCOPE=all`.
 
 ---
 
