@@ -14,9 +14,9 @@ tag = "v1"
 new_sqlite_classes = ["WebhookRelay"]
 
 [[kv_namespaces]]
-binding = "REGISTRY"
+binding = "PULLPILOT_REGISTRY"
 # One-time setup (creates the prod namespace and prints its id):
-#   wrangler kv namespace create REGISTRY
+#   wrangler kv namespace create PULLPILOT_REGISTRY
 id = "REPLACE_WITH_PROD_KV_ID"
 
 [vars]
@@ -36,9 +36,9 @@ name = "WEBHOOK"
 class_name = "WebhookRelay"
 
 [[env.test.kv_namespaces]]
-binding = "REGISTRY"
+binding = "PULLPILOT_REGISTRY"
 # One-time setup (creates the test namespace and prints its id):
-#   wrangler kv namespace create REGISTRY --env test
+#   wrangler kv namespace create PULLPILOT_REGISTRY --env test
 id = "REPLACE_WITH_TEST_KV_ID"
 
 # PRODUCTION environment -> pullpilot-relay.jclement.workers.dev
@@ -54,7 +54,7 @@ name = "WEBHOOK"
 class_name = "WebhookRelay"
 
 [[env.production.kv_namespaces]]
-binding = "REGISTRY"
+binding = "PULLPILOT_REGISTRY"
 # Reuses the same prod namespace id created above via:
-#   wrangler kv namespace create REGISTRY
+#   wrangler kv namespace create PULLPILOT_REGISTRY
 id = "REPLACE_WITH_PROD_KV_ID"

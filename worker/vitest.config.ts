@@ -17,12 +17,10 @@ export default defineWorkersConfig({
         // fresh webhookId per test, so cross-test leakage is not a concern.
         singleWorker: true,
         isolatedStorage: false,
+        // Bindings (the WEBHOOK DO and PULLPILOT_REGISTRY KV namespace) are
+        // derived from wrangler.toml; the pool provisions a local in-memory KV
+        // automatically, so the production KV id placeholder is irrelevant here.
         wrangler: { configPath: "./wrangler.toml" },
-        miniflare: {
-          // Provide a local KV namespace for REGISTRY (the toml id is a
-          // production placeholder; tests use an in-memory namespace).
-          kvNamespaces: ["REGISTRY"],
-        },
       },
     },
   },

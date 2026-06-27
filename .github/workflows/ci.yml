@@ -60,8 +60,8 @@ jobs:
     env:
       KO_DOCKER_REPO: ghcr.io/jclement/pullpilot
       PP_WEBHOOK_DEFAULT: https://pullpilot-relay-test.jclement.workers.dev
-      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-      CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
@@ -80,10 +80,10 @@ jobs:
       - name: Build & push edge image
         run: ko build ./cmd/pullpilot --bare --platform=linux/amd64,linux/arm64 --tags=latest,edge
       - name: Deploy worker to TEST
-        if: ${{ env.CF_API_TOKEN != '' }}
+        if: ${{ env.CLOUDFLARE_API_TOKEN != '' }}
         uses: cloudflare/wrangler-action@v3
         with:
-          apiToken: ${{ secrets.CF_API_TOKEN }}
-          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: worker
           command: deploy --env test

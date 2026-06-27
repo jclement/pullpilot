@@ -29,7 +29,7 @@ export interface Env {
   /** Durable Object namespace; one DO instance per webhookId (idFromName). */
   WEBHOOK: DurableObjectNamespace<WebhookRelay>;
   /** KV registry of provisioned webhooks. Keys: `wh:<webhookId>`. */
-  REGISTRY: KVNamespace;
+  PULLPILOT_REGISTRY: KVNamespace;
   /** Reported by `/version`. */
   WORKER_VERSION?: string;
   /** KV expiration TTL (seconds). Default 6 months. Refreshed on activity. */
@@ -78,7 +78,7 @@ export async function getWebhookRecord(
   env: Env,
   webhookId: string,
 ): Promise<WebhookRecord | null> {
-  const raw = await env.REGISTRY.get(registryKey(webhookId));
+  const raw = await env.PULLPILOT_REGISTRY.get(registryKey(webhookId));
   if (raw === null) return null;
   try {
     return JSON.parse(raw) as WebhookRecord;
@@ -97,7 +97,7 @@ export async function touchWebhook(env: Env, webhookId: string): Promise<void> {
   const record = await getWebhookRecord(env, webhookId);
   if (!record) return;
   record.lastSeen = new Date().toISOString();
-  await env.REGISTRY.put(registryKey(webhookId), JSON.stringify(record), {
+  await env.PULLPILOT_REGISTRY.put(registryKey(webhookId), JSON.stringify(record), {
     expirationTtl: pruneAfterSeconds(env),
   });
 }
@@ -135,11 +135,11 @@ function clientIp(request: Request): string {
  */
 async function isRateLimited(env: Env, ip: string): Promise<boolean> {
   const key = `rl:provision:${ip}`;
-  const current = Number.parseInt((await env.REGISTRY.get(key)) ?? "0", 10);
+  const current = Number.parseInt((await env.PULLPILOT_REGISTRY.get(key)) ?? "0", 10);
   if (current >= PROVISION_RATE_LIMIT) return true;
   // Increment with a fresh window TTL. Resetting the TTL on every request makes
   // this a sliding window approximation; acceptable for abuse mitigation.
-  await env.REGISTRY.put(key, String(current + 1), {
+  await env.PULLPILOT_REGISTRY.put(key, String(current + 1), {
     expirationTtl: PROVISION_RATE_WINDOW,
   });
   return false;
@@ -225,7 +225,7 @@ async function handleProvision(request: Request, env: Env): Promise<Response> {
   };
 
   const ttl = pruneAfterSeconds(env);
-  await env.REGISTRY.put(registryKey(webhookId), JSON.stringify(record), {
+  await env.PULLPILOT_REGISTRY.put(registryKey(webhookId), JSON.stringify(record), {
     expirationTtl: ttl,
   });
 

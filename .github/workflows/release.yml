@@ -37,15 +37,15 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     env:
-      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
       - name: Deploy worker to PRODUCTION
-        if: ${{ env.CF_API_TOKEN != '' }}
+        if: ${{ env.CLOUDFLARE_API_TOKEN != '' }}
         uses: cloudflare/wrangler-action@v3
         with:
-          apiToken: ${{ secrets.CF_API_TOKEN }}
-          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: worker
           command: deploy --env production --var WORKER_VERSION:${{ github.ref_name }}

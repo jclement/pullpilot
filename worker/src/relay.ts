@@ -487,7 +487,7 @@ export class WebhookRelay extends DurableObject<Env> {
   // -------------------------------------------------------------------------
 
   private async getRecord(webhookId: string): Promise<WebhookRecord | null> {
-    const raw = await this.env.REGISTRY.get(`wh:${webhookId}`);
+    const raw = await this.env.PULLPILOT_REGISTRY.get(`wh:${webhookId}`);
     if (raw === null) return null;
     try {
       return JSON.parse(raw) as WebhookRecord;
@@ -502,7 +502,7 @@ export class WebhookRelay extends DurableObject<Env> {
     record.lastSeen = new Date().toISOString();
     const parsed = Number.parseInt(this.env.PRUNE_AFTER ?? "", 10);
     const ttl = Number.isFinite(parsed) && parsed > 0 ? parsed : 15_552_000;
-    await this.env.REGISTRY.put(`wh:${webhookId}`, JSON.stringify(record), {
+    await this.env.PULLPILOT_REGISTRY.put(`wh:${webhookId}`, JSON.stringify(record), {
       expirationTtl: ttl,
     });
   }
