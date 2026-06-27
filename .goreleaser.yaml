@@ -18,7 +18,7 @@ builds:
       - -X github.com/jclement/pullpilot/internal/version.Commit={{.ShortCommit}}
       - -X github.com/jclement/pullpilot/internal/version.Date={{.CommitDate}}
       # Release binaries default to the PRODUCTION relay.
-      - -X github.com/jclement/pullpilot/internal/version.DefaultWebhookURL=https://pullpilot-relay.jclement.workers.dev
+      - -X github.com/jclement/pullpilot/internal/version.DefaultWebhookURL=https://pullpilot-relay.jeffrey-clement.workers.dev
     goos: [linux, darwin]
     goarch: [amd64, arm64]
 

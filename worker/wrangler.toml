@@ -23,7 +23,7 @@ id = "711201ec21394c6fbf372c8a3d05cc3d"
 WORKER_VERSION = "dev"
 PRUNE_AFTER = "15552000"   # 6 months, seconds
 
-# TEST environment -> pullpilot-relay-test.jclement.workers.dev
+# TEST environment -> pullpilot-relay-test.jeffrey-clement.workers.dev
 [env.test]
 name = "pullpilot-relay-test"
 
@@ -41,7 +41,7 @@ binding = "PULLPILOT_REGISTRY"
 #   wrangler kv namespace create PULLPILOT_REGISTRY --env test
 id = "72a763d694c948e2bec968c435eacf5b"
 
-# PRODUCTION environment -> pullpilot-relay.jclement.workers.dev
+# PRODUCTION environment -> pullpilot-relay.jeffrey-clement.workers.dev
 [env.production]
 name = "pullpilot-relay"
 

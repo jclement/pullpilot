@@ -21,7 +21,7 @@ services:
       # Instant updates via webhook (off by default). Requires a PERSISTENT
       # data volume — otherwise the webhook identity (and URL) changes on restart.
       # PP_WEBHOOK: "true"
-      # PP_WEBHOOK_URL: https://pullpilot-relay.jclement.workers.dev
+      # PP_WEBHOOK_URL: https://pullpilot-relay.jeffrey-clement.workers.dev
     volumes:
       - pullpilot-data:/data
     read_only: true

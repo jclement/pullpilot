@@ -15,7 +15,7 @@ var (
 
 	// DefaultWebhookURL is the relay used when PP_WEBHOOK is enabled but
 	// PP_WEBHOOK_URL is not set. Always overridable via env.
-	DefaultWebhookURL = "https://pullpilot-relay.jclement.workers.dev"
+	DefaultWebhookURL = "https://pullpilot-relay.jeffrey-clement.workers.dev"
 )
 
 // String returns a human-readable version line.
