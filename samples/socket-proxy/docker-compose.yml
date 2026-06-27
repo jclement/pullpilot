@@ -1,0 +1,60 @@
+# Hardened PullPilot deployment behind a Docker socket-proxy.
+#
+# PullPilot reaches Docker over TCP through a proxy that only exposes the API
+# endpoints it needs, so the daemon never holds the raw socket and runs fully
+# non-root + read-only. The proxy's port is NOT published to the host — it's
+# reachable only on the compose network.
+#
+#   docker compose -f samples/socket-proxy/docker-compose.yml up -d
+#
+# IMPORTANT: this is defense-in-depth, NOT a hard boundary. Recreating
+# containers requires POST, which is itself enough to escalate to host root, so
+# the proxy only limits *incidental* API surface. The real mitigation for the
+# root-equivalence is rootless Docker. See the README "Security" section.
+
+services:
+  pullpilot:
+    image: ghcr.io/jclement/pullpilot:stable
+    container_name: pullpilot
+    environment:
+      DOCKER_HOST: tcp://docker-socket-proxy:2375   # talk to the proxy, not the socket
+      PP_TIMEZONE: America/Edmonton
+      PP_SOAK: 24h
+      PP_DATA_DIR: /data
+    volumes:
+      - pullpilot-data:/data
+    user: "65532:65532"                  # distroless nonroot — no socket perms needed
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp]
+    networks: [pullpilot]
+    depends_on: [docker-socket-proxy]
+    restart: unless-stopped
+
+  # The proxy actually holds the socket, so harden it too (it's the privileged
+  # trust boundary). If it fails to start, drop `read_only`/`tmpfs` first.
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.3.0
+    environment:
+      CONTAINERS: 1
+      IMAGES: 1
+      NETWORKS: 1
+      POST: 1            # required — PullPilot recreates containers
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/run, /tmp]
+    networks: [pullpilot]
+    restart: unless-stopped
+
+volumes:
+  pullpilot-data:
+
+# A normal (non-internal) bridge: PullPilot reaches the proxy by name AND has
+# outbound internet for registry/relay calls. Do NOT set `internal: true` — it
+# would cut off the registry checks.
+networks:
+  pullpilot:

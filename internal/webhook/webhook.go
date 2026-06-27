@@ -48,11 +48,13 @@ type Client struct {
 	pendingTimer *time.Timer
 }
 
+// registration mirrors the relay's provision response (camelCase keys) plus a
+// baseUrl we record ourselves so we can detect a relay change on reload.
 type registration struct {
-	BaseURL   string `json:"base_url"`
-	WebhookID string `json:"webhook_id"`
-	PokeURL   string `json:"poke_url"`
-	ListenURL string `json:"listen_url"`
+	BaseURL   string `json:"baseUrl"`
+	WebhookID string `json:"webhookId"`
+	PokeURL   string `json:"pokeUrl"`
+	ListenURL string `json:"listenUrl"`
 }
 
 // New loads or creates the keypair, then loads or provisions the webhook.
@@ -106,7 +108,8 @@ func (c *Client) loadOrProvision() error {
 		var r registration
 		if json.Unmarshal(data, &r) == nil && r.WebhookID != "" && r.BaseURL == c.baseURL {
 			c.webhookID, c.listenURL = r.WebhookID, r.ListenURL
-			c.log.Info().Str("poke_url", c.PokeURL()).Msg("loaded existing webhook")
+			c.log.Info().Str("poke_url", c.PokeURL()).
+				Msg("webhook ready — POST to this poke URL to trigger an instant update check")
 			return nil
 		}
 	}
@@ -143,7 +146,8 @@ func (c *Client) provision() error {
 	if err := os.WriteFile(c.regPath(), data, 0o600); err != nil {
 		return fmt.Errorf("save webhook: %w", err)
 	}
-	c.log.Info().Str("poke_url", c.PokeURL()).Msg("provisioned new webhook")
+	c.log.Info().Str("poke_url", c.PokeURL()).
+		Msg("webhook provisioned — POST to this poke URL to trigger an instant update check")
 	return nil
 }
 

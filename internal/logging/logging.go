@@ -1,18 +1,18 @@
-// Package logging configures a zerolog logger: colored console output on a TTY,
-// structured JSON otherwise (systemd / Docker log drivers).
+// Package logging configures a zerolog logger. By default it emits colored,
+// human-readable console output (readable straight out of `docker logs`); set
+// PP_LOG_JSON=true for structured JSON. Colors honor the NO_COLOR convention.
 package logging
 
 import (
 	"os"
 	"time"
 
-	"github.com/mattn/go-isatty"
 	"github.com/rs/zerolog"
 )
 
 // New returns a configured logger. level is one of trace/debug/info/warn/error.
-// forceJSON disables the pretty console writer even on a TTY.
-func New(level string, forceJSON bool) zerolog.Logger {
+// jsonOut forces structured JSON instead of the colored console writer.
+func New(level string, jsonOut bool) zerolog.Logger {
 	lvl, err := zerolog.ParseLevel(level)
 	if err != nil || lvl == zerolog.NoLevel {
 		lvl = zerolog.InfoLevel
@@ -20,9 +20,12 @@ func New(level string, forceJSON bool) zerolog.Logger {
 	zerolog.SetGlobalLevel(lvl)
 	zerolog.TimeFieldFormat = time.RFC3339
 
-	if !forceJSON && isatty.IsTerminal(os.Stderr.Fd()) {
-		w := zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: "15:04:05"}
-		return zerolog.New(w).With().Timestamp().Logger()
+	if jsonOut {
+		return zerolog.New(os.Stderr).With().Timestamp().Logger()
 	}
-	return zerolog.New(os.Stderr).With().Timestamp().Logger()
+	w := zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: "15:04:05"}
+	if os.Getenv("NO_COLOR") != "" {
+		w.NoColor = true
+	}
+	return zerolog.New(w).With().Timestamp().Logger()
 }
