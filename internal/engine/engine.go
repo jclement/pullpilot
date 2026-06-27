@@ -5,6 +5,8 @@ package engine
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +21,7 @@ import (
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
+	apiregistry "github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/client"
 	"github.com/rs/zerolog"
 
@@ -718,15 +721,34 @@ func (e *Engine) healthGate(ctx context.Context, id string, set labels.Settings)
 	}
 }
 
-// pull fetches the image and drains the progress stream to completion.
+// pull fetches the image and drains the progress stream to completion. It
+// forwards registry credentials to the Docker daemon (the daemon does its own
+// auth and never sees PullPilot's mounted config.json), so private images pull.
 func (e *Engine) pull(ctx context.Context, ref string) error {
-	rc, err := e.cli.ImagePull(ctx, ref, image.PullOptions{})
+	opts := image.PullOptions{}
+	if user, pass, host, ok := e.reg.Credentials(ref); ok {
+		if auth, err := encodeRegistryAuth(user, pass, host); err == nil {
+			opts.RegistryAuth = auth
+			e.log.Debug().Str("registry", host).Msg("pulling with registry credentials")
+		}
+	}
+	rc, err := e.cli.ImagePull(ctx, ref, opts)
 	if err != nil {
 		return err
 	}
 	defer rc.Close()
 	_, err = io.Copy(io.Discard, rc)
 	return err
+}
+
+// encodeRegistryAuth builds the base64 X-Registry-Auth value the Docker daemon
+// expects for an authenticated pull.
+func encodeRegistryAuth(user, pass, server string) (string, error) {
+	buf, err := json.Marshal(apiregistry.AuthConfig{Username: user, Password: pass, ServerAddress: server})
+	if err != nil {
+		return "", err
+	}
+	return base64.URLEncoding.EncodeToString(buf), nil
 }
 
 // buildNetworking returns a NetworkingConfig that attaches the primary network

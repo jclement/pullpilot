@@ -1,11 +1,32 @@
 package engine
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"testing"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/network"
+	apiregistry "github.com/docker/docker/api/types/registry"
 )
+
+func TestEncodeRegistryAuth(t *testing.T) {
+	enc, err := encodeRegistryAuth("alice", "ghp_secret", "ghcr.io")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := base64.URLEncoding.DecodeString(enc)
+	if err != nil {
+		t.Fatalf("auth is not valid base64url: %v", err)
+	}
+	var ac apiregistry.AuthConfig
+	if err := json.Unmarshal(raw, &ac); err != nil {
+		t.Fatalf("auth is not valid JSON: %v", err)
+	}
+	if ac.Username != "alice" || ac.Password != "ghp_secret" || ac.ServerAddress != "ghcr.io" {
+		t.Errorf("decoded auth = %+v", ac)
+	}
+}
 
 func TestMatchRepoDigest(t *testing.T) {
 	dg := "sha256:0000000000000000000000000000000000000000000000000000000000000000"

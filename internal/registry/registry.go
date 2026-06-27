@@ -257,6 +257,19 @@ func (c *Client) authenticate(ctx context.Context, ref Ref, ch *challenge) (stri
 	return body.AccessToken, nil
 }
 
+// Credentials returns the stored basic-auth username/password and registry host
+// for an image, so they can be forwarded to the Docker daemon when it pulls
+// (the daemon does not see PullPilot's mounted config.json). ok is false if no
+// credentials are configured for that registry.
+func (c *Client) Credentials(image string) (user, pass, host string, ok bool) {
+	ref, err := ParseRef(image)
+	if err != nil {
+		return "", "", "", false
+	}
+	u, p, found := c.creds.Basic(ref.Registry)
+	return u, p, ref.Registry, found
+}
+
 // CredStore holds registry credentials parsed from a Docker config.json.
 type CredStore struct {
 	auths map[string]string // registry host -> base64(user:pass)
