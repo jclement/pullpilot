@@ -1,0 +1,17 @@
+# Used by CI to build the edge (:latest) image. Release images are built by
+# GoReleaser (see .goreleaser.yaml). The default webhook URL is baked from the
+# PP_WEBHOOK_DEFAULT env var so CI can point edge builds at the TEST relay.
+defaultBaseImage: gcr.io/distroless/static-debian12:nonroot
+builds:
+  - id: pullpilot
+    main: ./cmd/pullpilot
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/jclement/pullpilot/internal/version.Version={{.Env.PP_VERSION}}
+      - -X github.com/jclement/pullpilot/internal/version.Commit={{.Env.PP_COMMIT}}
+      - -X github.com/jclement/pullpilot/internal/version.Date={{.Env.PP_DATE}}
+      - -X github.com/jclement/pullpilot/internal/version.DefaultWebhookURL={{.Env.PP_WEBHOOK_DEFAULT}}

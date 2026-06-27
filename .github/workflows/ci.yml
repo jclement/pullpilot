@@ -1,0 +1,84 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Go test & vet
+        run: |
+          go test ./...
+          go vet ./...
+      - name: Worker test
+        working-directory: worker
+        run: |
+          npm ci
+          npm test
+
+  vuln:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: golang/govulncheck-action@v1
+        with:
+          go-version-input: "1.24"
+
+  trivy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+
+  # Build & push the edge (:latest) image and deploy the worker to TEST.
+  # Edge binaries default to the TEST relay.
+  edge:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      KO_DOCKER_REPO: ghcr.io/jclement/pullpilot
+      PP_WEBHOOK_DEFAULT: https://pullpilot-relay-test.jclement.workers.dev
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - uses: ko-build/setup-ko@v0.8
+      - name: Set build vars
+        run: |
+          echo "PP_VERSION=edge-$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "PP_COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "PP_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build & push edge image
+        run: ko build ./cmd/pullpilot --bare --platform=linux/amd64,linux/arm64 --tags=latest,edge
+      - name: Deploy worker to TEST
+        if: ${{ env.CF_API_TOKEN != '' }}
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          workingDirectory: worker
+          command: deploy --env test

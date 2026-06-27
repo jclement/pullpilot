@@ -1,0 +1,60 @@
+name = "pullpilot-relay"
+main = "src/index.ts"
+compatibility_date = "2026-06-01"
+
+[[durable_objects.bindings]]
+name = "WEBHOOK"
+class_name = "WebhookRelay"
+
+# Durable Object migrations are TOP-LEVEL only in Wrangler v4 (they cannot be
+# nested under [env.*]). A single top-level migration block applies to every
+# environment, so it must NOT be duplicated under env.test / env.production.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WebhookRelay"]
+
+[[kv_namespaces]]
+binding = "REGISTRY"
+# One-time setup (creates the prod namespace and prints its id):
+#   wrangler kv namespace create REGISTRY
+id = "REPLACE_WITH_PROD_KV_ID"
+
+[vars]
+WORKER_VERSION = "dev"
+PRUNE_AFTER = "15552000"   # 6 months, seconds
+
+# TEST environment -> pullpilot-relay-test.jclement.workers.dev
+[env.test]
+name = "pullpilot-relay-test"
+
+[env.test.vars]
+WORKER_VERSION = "dev"
+PRUNE_AFTER = "15552000"
+
+[[env.test.durable_objects.bindings]]
+name = "WEBHOOK"
+class_name = "WebhookRelay"
+
+[[env.test.kv_namespaces]]
+binding = "REGISTRY"
+# One-time setup (creates the test namespace and prints its id):
+#   wrangler kv namespace create REGISTRY --env test
+id = "REPLACE_WITH_TEST_KV_ID"
+
+# PRODUCTION environment -> pullpilot-relay.jclement.workers.dev
+[env.production]
+name = "pullpilot-relay"
+
+[env.production.vars]
+WORKER_VERSION = "dev"
+PRUNE_AFTER = "15552000"
+
+[[env.production.durable_objects.bindings]]
+name = "WEBHOOK"
+class_name = "WebhookRelay"
+
+[[env.production.kv_namespaces]]
+binding = "REGISTRY"
+# Reuses the same prod namespace id created above via:
+#   wrangler kv namespace create REGISTRY
+id = "REPLACE_WITH_PROD_KV_ID"

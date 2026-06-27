@@ -1,0 +1,556 @@
+// Package engine implements PullPilot's update cycle: discover in-scope
+// containers, decide which have a genuinely newer (and soaked) image, and
+// recreate them with health-gated rollback.
+package engine
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/client"
+	"github.com/rs/zerolog"
+
+	"github.com/jclement/pullpilot/internal/config"
+	"github.com/jclement/pullpilot/internal/labels"
+	"github.com/jclement/pullpilot/internal/registry"
+	"github.com/jclement/pullpilot/internal/state"
+)
+
+// Notifier receives human-facing events (updates, rollbacks, failures).
+type Notifier interface {
+	Notify(ctx context.Context, title, body string)
+}
+
+// Engine orchestrates one or more update cycles.
+type Engine struct {
+	cli  *client.Client
+	reg  *registry.Client
+	st   *state.State
+	cfg  *config.Config
+	log  zerolog.Logger
+	note Notifier
+
+	selfID  string
+	project string
+}
+
+// New connects to Docker, identifies PullPilot's own container, and resolves
+// the default update scope (its own Compose project).
+func New(cfg *config.Config, st *state.State, log zerolog.Logger, note Notifier) (*Engine, error) {
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return nil, fmt.Errorf("docker client: %w", err)
+	}
+	e := &Engine{cli: cli, reg: registry.New(), st: st, cfg: cfg, log: log, note: note}
+	e.identifySelf(context.Background())
+	return e, nil
+}
+
+// Close releases the Docker client.
+func (e *Engine) Close() error { return e.cli.Close() }
+
+// identifySelf finds PullPilot's own container (hostname == container ID, or the
+// io.pullpilot.self label) and records its Compose project for default scoping.
+func (e *Engine) identifySelf(ctx context.Context) {
+	host, _ := os.Hostname()
+	list, err := e.cli.ContainerList(ctx, container.ListOptions{All: true})
+	if err != nil {
+		return
+	}
+	for _, c := range list {
+		if host != "" && strings.HasPrefix(c.ID, host) {
+			e.selfID = c.ID
+			e.project = c.Labels[labels.ComposeProject]
+			return
+		}
+	}
+	for _, c := range list {
+		if labels.Parse(c.Labels, false).IsSelf {
+			e.selfID = c.ID
+			e.project = c.Labels[labels.ComposeProject]
+			return
+		}
+	}
+}
+
+// Action is the decided outcome for a container.
+type Action string
+
+const (
+	ActionUpToDate Action = "up-to-date"
+	ActionSkip     Action = "skip"
+	ActionMonitor  Action = "monitor"
+	ActionSoaking  Action = "soaking"
+	ActionUpdate   Action = "update"
+)
+
+// plan is the per-container evaluation result.
+type plan struct {
+	id        string
+	name      string
+	image     string
+	current   string // running repo digest
+	available string // remote digest
+	action    Action
+	reason    string
+	soakLeft  time.Duration
+	inspect   types.ContainerJSON
+	settings  labels.Settings
+	running   bool
+}
+
+// Run executes one full cycle. trigger is "schedule" or "webhook" (for logs).
+func (e *Engine) Run(ctx context.Context, trigger string) {
+	start := time.Now()
+	e.log.Info().Str("trigger", trigger).Str("scope", e.scopeLabel()).Msg("update cycle starting")
+
+	targets, err := e.discover(ctx)
+	if err != nil {
+		e.log.Error().Err(err).Msg("discovery failed")
+		return
+	}
+
+	var updated, soaking, failed int
+	plans := make([]plan, 0, len(targets))
+	for _, t := range targets {
+		p := e.evaluate(ctx, t)
+		plans = append(plans, p)
+	}
+	// Stable, deterministic order (io.pullpilot.order then name).
+	sort.SliceStable(plans, func(i, j int) bool {
+		if plans[i].settings.Order != plans[j].settings.Order {
+			return plans[i].settings.Order < plans[j].settings.Order
+		}
+		return plans[i].name < plans[j].name
+	})
+
+	for _, p := range plans {
+		switch p.action {
+		case ActionUpdate:
+			if e.cfg.DryRun {
+				e.log.Info().Str("container", p.name).Str("image", p.image).
+					Str("from", short(p.current)).Str("to", short(p.available)).
+					Msg("[dry-run] would update")
+				continue
+			}
+			if err := e.apply(ctx, p); err != nil {
+				failed++
+				e.log.Error().Err(err).Str("container", p.name).Msg("update failed")
+			} else {
+				updated++
+			}
+		case ActionSoaking:
+			soaking++
+			e.log.Info().Str("container", p.name).Str("image", p.image).
+				Str("to", short(p.available)).Dur("soak_left", p.soakLeft.Round(time.Minute)).
+				Msg("new image detected, soaking")
+			e.note.Notify(ctx, "Update soaking: "+p.name,
+				fmt.Sprintf("%s has a new image (%s); rolling out in %s unless stopped.",
+					p.name, short(p.available), p.soakLeft.Round(time.Minute)))
+		case ActionMonitor:
+			e.log.Info().Str("container", p.name).Str("to", short(p.available)).
+				Msg("update available (monitor-only)")
+			e.note.Notify(ctx, "Update available: "+p.name,
+				fmt.Sprintf("%s has a new image (%s). monitor-only — not applied.", p.name, short(p.available)))
+		default:
+			e.log.Debug().Str("container", p.name).Str("action", string(p.action)).
+				Str("reason", p.reason).Msg("no action")
+		}
+	}
+
+	e.log.Info().Int("updated", updated).Int("soaking", soaking).Int("failed", failed).
+		Int("checked", len(plans)).Dur("took", time.Since(start).Round(time.Millisecond)).
+		Msg("update cycle complete")
+}
+
+func (e *Engine) scopeLabel() string {
+	switch e.cfg.Scope.Mode {
+	case "all":
+		return "all"
+	default:
+		p := e.cfg.Scope.Project
+		if p == "" {
+			p = e.project
+		}
+		if p == "" {
+			return "project:(unknown)"
+		}
+		return "project:" + p
+	}
+}
+
+// discover enumerates in-scope, eligible containers (including stopped ones).
+func (e *Engine) discover(ctx context.Context) ([]target, error) {
+	opts := container.ListOptions{All: true}
+	if e.cfg.Scope.Mode == "project" {
+		proj := e.cfg.Scope.Project
+		if proj == "" {
+			proj = e.project
+		}
+		if proj != "" {
+			opts.Filters = filters.NewArgs(filters.Arg("label", labels.ComposeProject+"="+proj))
+		}
+	}
+	list, err := e.cli.ContainerList(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	var targets []target
+	for _, c := range list {
+		set := labels.Parse(c.Labels, e.cfg.CompatWatchtower)
+		if !e.eligible(c.ID, set) {
+			continue
+		}
+		insp, err := e.cli.ContainerInspect(ctx, c.ID)
+		if err != nil {
+			e.log.Warn().Err(err).Str("container", trimName(c.Names)).Msg("inspect failed, skipping")
+			continue
+		}
+		targets = append(targets, target{
+			id:      c.ID,
+			name:    strings.TrimPrefix(insp.Name, "/"),
+			image:   insp.Config.Image,
+			inspect: insp,
+			set:     set,
+			running: insp.State != nil && insp.State.Running,
+		})
+	}
+	return targets, nil
+}
+
+// eligible applies scope and label opt-in/opt-out rules.
+func (e *Engine) eligible(id string, set labels.Settings) bool {
+	if id == e.selfID && !e.cfg.SelfUpdate {
+		return false // self handled separately / disabled
+	}
+	if set.Oneoff || set.Exclude {
+		return false
+	}
+	if set.Enable != nil && !*set.Enable {
+		return false
+	}
+	// In "all" scope we manage everything not explicitly excluded; otherwise the
+	// compose-project filter already scoped us.
+	return true
+}
+
+type target struct {
+	id      string
+	name    string
+	image   string
+	inspect types.ContainerJSON
+	set     labels.Settings
+	running bool
+}
+
+// evaluate decides the action for one container.
+func (e *Engine) evaluate(ctx context.Context, t target) plan {
+	p := plan{id: t.id, name: t.name, image: t.image, inspect: t.inspect, settings: t.set, running: t.running}
+
+	ref, err := registry.ParseRef(t.image)
+	if err != nil {
+		p.action, p.reason = ActionSkip, "unparseable image ref"
+		return p
+	}
+	if ref.Pinned() {
+		p.action, p.reason = ActionSkip, "pinned by digest"
+		return p
+	}
+
+	current, err := e.runningDigest(ctx, t)
+	if err != nil || current == "" {
+		p.action, p.reason = ActionSkip, "no local repo digest (locally-built image?)"
+		return p
+	}
+	p.current = current
+
+	remote, err := e.reg.RemoteDigest(ctx, t.image)
+	if err != nil {
+		p.action, p.reason = ActionSkip, "registry check failed: "+err.Error()
+		e.log.Warn().Err(err).Str("container", t.name).Msg("registry check failed")
+		return p
+	}
+	p.available = remote
+
+	if remote == current {
+		p.action, p.reason = ActionUpToDate, "current"
+		return p
+	}
+	if e.st.IsBad(remote) {
+		p.action, p.reason = ActionSkip, "digest previously failed health check"
+		return p
+	}
+	if t.set.MonitorOnly {
+		p.action, p.reason = ActionMonitor, "monitor-only"
+		return p
+	}
+
+	// Soak gate.
+	soak := e.cfg.Soak
+	if t.set.Soak != nil {
+		soak = *t.set.Soak
+	}
+	first := e.st.SeenAt(t.name, remote, time.Now())
+	if elapsed := time.Since(first); elapsed < soak {
+		p.action, p.reason = ActionSoaking, "within soak window"
+		p.soakLeft = soak - elapsed
+		return p
+	}
+	p.action, p.reason = ActionUpdate, "newer image, soak elapsed"
+	return p
+}
+
+// runningDigest returns the repo digest of the image the container is running.
+func (e *Engine) runningDigest(ctx context.Context, t target) (string, error) {
+	insp, _, err := e.cli.ImageInspectWithRaw(ctx, t.inspect.Image)
+	if err != nil {
+		return "", err
+	}
+	return matchRepoDigest(t.image, insp.RepoDigests), nil
+}
+
+// matchRepoDigest picks the digest whose repository matches the image ref.
+func matchRepoDigest(image string, repoDigests []string) string {
+	if len(repoDigests) == 0 {
+		return ""
+	}
+	want, err := registry.ParseRef(image)
+	if err == nil {
+		for _, rd := range repoDigests {
+			name, dg, ok := strings.Cut(rd, "@")
+			if !ok {
+				continue
+			}
+			if got, err := registry.ParseRef(name); err == nil &&
+				got.Repository == want.Repository && got.Registry == want.Registry {
+				return dg
+			}
+		}
+	}
+	if _, dg, ok := strings.Cut(repoDigests[0], "@"); ok {
+		return dg
+	}
+	return ""
+}
+
+// apply pulls the new image and recreates the container, health-gating the
+// result and rolling back to the prior container on failure.
+func (e *Engine) apply(ctx context.Context, p plan) error {
+	e.log.Info().Str("container", p.name).Str("image", p.image).
+		Str("from", short(p.current)).Str("to", short(p.available)).Msg("updating")
+
+	// 1. Pull the new image fully BEFORE touching the running container.
+	if err := e.pull(ctx, p.image); err != nil {
+		return fmt.Errorf("pull: %w", err)
+	}
+
+	oldName := p.name
+	tmpName := p.name + "_pp_old"
+	insp := p.inspect
+
+	// 2. Stop (honoring grace) and free the name by renaming the old container.
+	stopTimeout := (*int)(nil)
+	if p.settings.StopTimeout != nil {
+		s := int(p.settings.StopTimeout.Seconds())
+		stopTimeout = &s
+	}
+	if p.running {
+		if err := e.cli.ContainerStop(ctx, p.id, container.StopOptions{Timeout: stopTimeout}); err != nil {
+			return fmt.Errorf("stop old: %w", err)
+		}
+	}
+	if err := e.cli.ContainerRename(ctx, p.id, tmpName); err != nil {
+		return fmt.Errorf("rename old: %w", err)
+	}
+
+	// 3. Create the replacement from the old container's config + new image.
+	cfg := *insp.Config
+	cfg.Image = p.image
+	hostCfg := insp.HostConfig
+	netCfg, extraNets := buildNetworking(insp.NetworkSettings)
+
+	created, err := e.cli.ContainerCreate(ctx, &cfg, hostCfg, netCfg, nil, oldName)
+	if err != nil {
+		// Recreate failed: restore the old container.
+		e.rollback(ctx, p, tmpName, "")
+		return fmt.Errorf("create new: %w", err)
+	}
+
+	// 4. Attach any additional networks (create reliably attaches only one).
+	for name, ep := range extraNets {
+		if err := e.cli.NetworkConnect(ctx, name, created.ID, ep); err != nil {
+			e.log.Warn().Err(err).Str("network", name).Msg("attach extra network failed")
+		}
+	}
+
+	// 5. Start (only if the old one was running) and health-gate.
+	if p.running {
+		if err := e.cli.ContainerStart(ctx, created.ID, container.StartOptions{}); err != nil {
+			e.rollback(ctx, p, tmpName, created.ID)
+			return fmt.Errorf("start new: %w", err)
+		}
+		if err := e.healthGate(ctx, created.ID, p.settings); err != nil {
+			e.st.MarkBad(p.available)
+			e.rollback(ctx, p, tmpName, created.ID)
+			e.note.Notify(ctx, "Update rolled back: "+p.name,
+				fmt.Sprintf("%s failed health check on %s and was rolled back to %s.",
+					p.name, short(p.available), short(p.current)))
+			return fmt.Errorf("health gate: %w", err)
+		}
+	}
+
+	// 6. Success: remove the old container (keep its volumes) and record state.
+	_ = e.cli.ContainerRemove(ctx, tmpName, container.RemoveOptions{})
+	e.st.MarkApplied(p.name, p.available)
+	if e.cfg.Cleanup {
+		if _, err := e.cli.ImageRemove(ctx, p.current, image.RemoveOptions{}); err != nil {
+			e.log.Debug().Err(err).Msg("old image cleanup skipped (still in use?)")
+		}
+	}
+	e.log.Info().Str("container", p.name).Str("now", short(p.available)).Msg("updated and healthy")
+	e.note.Notify(ctx, "Updated: "+p.name,
+		fmt.Sprintf("%s updated %s → %s and is healthy.", p.name, short(p.current), short(p.available)))
+	return nil
+}
+
+// rollback removes a failed new container and restores the renamed old one.
+func (e *Engine) rollback(ctx context.Context, p plan, tmpName, newID string) {
+	if newID != "" {
+		_ = e.cli.ContainerStop(ctx, newID, container.StopOptions{})
+		_ = e.cli.ContainerRemove(ctx, newID, container.RemoveOptions{})
+	}
+	if err := e.cli.ContainerRename(ctx, tmpName, p.name); err != nil {
+		e.log.Error().Err(err).Str("container", p.name).Msg("rollback rename failed — manual intervention may be needed")
+		return
+	}
+	if p.running {
+		if err := e.cli.ContainerStart(ctx, p.id, container.StartOptions{}); err != nil {
+			e.log.Error().Err(err).Str("container", p.name).Msg("rollback start failed")
+		}
+	}
+	e.log.Warn().Str("container", p.name).Str("restored", short(p.current)).Msg("rolled back")
+}
+
+// healthGate waits for the container to become healthy, or — when it has no
+// healthcheck — to stay running without restart-looping for a short window.
+func (e *Engine) healthGate(ctx context.Context, id string, set labels.Settings) error {
+	timeout := 90 * time.Second
+	if set.HealthTimeout != nil {
+		timeout = *set.HealthTimeout
+	}
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	var startRestarts int
+	first := true
+	for {
+		insp, err := e.cli.ContainerInspect(ctx, id)
+		if err != nil {
+			return err
+		}
+		if insp.State == nil {
+			return fmt.Errorf("no state")
+		}
+		if first {
+			startRestarts = insp.RestartCount
+			first = false
+		}
+		if insp.State.Health != nil {
+			switch insp.State.Health.Status {
+			case "healthy":
+				return nil
+			case "unhealthy":
+				return fmt.Errorf("container reported unhealthy")
+			}
+		} else {
+			// No healthcheck: require it to be running and not restart-looping.
+			if !insp.State.Running {
+				return fmt.Errorf("container exited (%d)", insp.State.ExitCode)
+			}
+			if insp.RestartCount > startRestarts {
+				return fmt.Errorf("container is restart-looping")
+			}
+			if time.Now().After(deadline.Add(-timeout / 2)) {
+				return nil // stable for half the window with no healthcheck
+			}
+		}
+		if time.Now().After(deadline) {
+			if insp.State.Health != nil {
+				return fmt.Errorf("did not become healthy within %s", timeout)
+			}
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// pull fetches the image and drains the progress stream to completion.
+func (e *Engine) pull(ctx context.Context, ref string) error {
+	rc, err := e.cli.ImagePull(ctx, ref, image.PullOptions{})
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+	_, err = io.Copy(io.Discard, rc)
+	return err
+}
+
+// buildNetworking returns a NetworkingConfig that attaches the primary network
+// at create time (preserving aliases) and the remaining networks to connect
+// afterward.
+func buildNetworking(ns *types.NetworkSettings) (*network.NetworkingConfig, map[string]*network.EndpointSettings) {
+	extra := map[string]*network.EndpointSettings{}
+	if ns == nil || len(ns.Networks) == 0 {
+		return &network.NetworkingConfig{}, extra
+	}
+	names := make([]string, 0, len(ns.Networks))
+	for n := range ns.Networks {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	primary := names[0]
+	cfg := &network.NetworkingConfig{EndpointsConfig: map[string]*network.EndpointSettings{
+		primary: {Aliases: aliasesOf(ns.Networks[primary])},
+	}}
+	for _, n := range names[1:] {
+		extra[n] = &network.EndpointSettings{Aliases: aliasesOf(ns.Networks[n])}
+	}
+	return cfg, extra
+}
+
+func aliasesOf(ep *network.EndpointSettings) []string {
+	if ep == nil {
+		return nil
+	}
+	return ep.Aliases
+}
+
+func short(digest string) string {
+	d := strings.TrimPrefix(digest, "sha256:")
+	if len(d) > 12 {
+		return d[:12]
+	}
+	return d
+}
+
+func trimName(names []string) string {
+	if len(names) == 0 {
+		return ""
+	}
+	return strings.TrimPrefix(names[0], "/")
+}

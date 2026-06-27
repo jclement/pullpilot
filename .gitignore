@@ -1,0 +1,23 @@
+# Go
+/bin/
+/dist/
+*.test
+*.out
+coverage.txt
+
+# Node / worker
+node_modules/
+worker/.wrangler/
+worker/dist/
+
+# Local data / secrets
+/data/
+*.local
+.env
+.dev.vars
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/

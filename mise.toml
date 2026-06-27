@@ -1,0 +1,38 @@
+[tools]
+go = "1.24"
+node = "22"
+"npm:wrangler" = "4"
+
+[env]
+# Local dev points the daemon at the locally-running worker.
+PP_WEBHOOK_URL = "http://127.0.0.1:8787"
+
+[tasks."dev:server"]
+description = "Run the Cloudflare Worker locally (http://127.0.0.1:8787)"
+dir = "worker"
+run = "npx wrangler dev --port 8787"
+
+[tasks."dev:client"]
+description = "Run the daemon locally against the local worker"
+env = { PP_LOG_LEVEL = "debug", PP_WEBHOOK = "true", PP_DATA_DIR = "./.data" }
+run = "go run ./cmd/pullpilot serve"
+
+[tasks.build]
+description = "Build the daemon binary into ./bin"
+run = "go build -o ./bin/pullpilot ./cmd/pullpilot"
+
+[tasks.test]
+description = "Run Go + worker tests"
+run = ["go test ./...", "cd worker && npm test"]
+
+[tasks.lint]
+description = "Vet Go + typecheck the worker"
+run = ["go vet ./...", "cd worker && npm run lint"]
+
+[tasks.snapshot]
+description = "Local GoReleaser dry-run (no publish)"
+run = "goreleaser release --snapshot --clean"
+
+[tasks.release]
+description = "Guess next semver, confirm, tag and push (drives the release workflow)"
+run = "./scripts/release.sh"

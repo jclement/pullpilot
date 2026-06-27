@@ -1,0 +1,56 @@
+# Example PullPilot deployment.
+#
+# PullPilot reaches Docker through a scoped socket-proxy on an internal network
+# (no host port), and runs non-root with a read-only rootfs. By default it
+# manages only the containers in THIS compose project, nightly at 03:00.
+#
+# See https://github.com/jclement/pullpilot for all options.
+
+services:
+  pullpilot:
+    image: ghcr.io/jclement/pullpilot:stable
+    container_name: pullpilot
+    environment:
+      # Talk to the daemon via the proxy, never the raw socket.
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
+      PP_TIMEZONE: America/Edmonton
+      PP_SOAK: 24h
+      PP_DATA_DIR: /data
+      # PP_NOTIFY_URL: "discord://token@id"   # optional shoutrrr URL
+      #
+      # Instant updates via webhook (off by default). Requires a PERSISTENT
+      # data volume — otherwise the webhook identity (and URL) changes on restart.
+      # PP_WEBHOOK: "true"
+      # PP_WEBHOOK_URL: https://pullpilot-relay.jclement.workers.dev
+    volumes:
+      - pullpilot-data:/data
+    read_only: true
+    user: "65532:65532"          # distroless nonroot
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp]
+    networks: [pullpilot]
+    depends_on: [docker-socket-proxy]
+    restart: unless-stopped
+
+  # Limits PullPilot's Docker API surface. POST is required because PullPilot
+  # recreates containers; combine with rootless Docker for the strongest
+  # containment (see README › Security).
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.3.0
+    environment:
+      CONTAINERS: 1
+      IMAGES: 1
+      NETWORKS: 1
+      POST: 1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [pullpilot]
+    restart: unless-stopped
+
+volumes:
+  pullpilot-data:
+
+networks:
+  pullpilot:
+    internal: true

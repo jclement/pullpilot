@@ -1,0 +1,60 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: pullpilot
+    main: ./cmd/pullpilot
+    binary: pullpilot
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/jclement/pullpilot/internal/version.Version={{.Version}}
+      - -X github.com/jclement/pullpilot/internal/version.Commit={{.ShortCommit}}
+      - -X github.com/jclement/pullpilot/internal/version.Date={{.CommitDate}}
+      # Release binaries default to the PRODUCTION relay.
+      - -X github.com/jclement/pullpilot/internal/version.DefaultWebhookURL=https://pullpilot-relay.jclement.workers.dev
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+sboms:
+  - artifacts: archive
+
+# Multi-arch images via ko (no Dockerfile, no docker daemon). Release images are
+# tagged :stable + the version; :latest is reserved for CI/edge builds.
+kos:
+  - id: pullpilot
+    build: pullpilot
+    base_image: gcr.io/distroless/static-debian12:nonroot
+    repositories:
+      - ghcr.io/jclement/pullpilot
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    sbom: spdx
+    bare: true
+    tags:
+      - "{{ .Version }}"
+      - "{{ .Major }}.{{ .Minor }}"
+      - "stable"
+
+release:
+  github:
+    owner: jclement
+    name: pullpilot
+  prerelease: auto
+
+changelog:
+  use: github
