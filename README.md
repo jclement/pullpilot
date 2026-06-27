@@ -477,6 +477,12 @@ your poke URL, can at worst cause an extra (rate-limited) check — never a forc
 or malicious update. The daemon authenticates its listen connection to the relay
 with an ed25519 challenge-response.
 
+> The held connection **reconnects every few minutes** — that's normal:
+> Cloudflare periodically recycles the Durable Object holding the socket. No pokes
+> are lost (the relay stores one pending poke and delivers it on reconnect, and
+> the scheduled poll is the backstop). Routine reconnects are silent at the
+> default log level; you'll only see a `WARN` if reconnection *keeps* failing.
+
 Enable it:
 
 ```yaml

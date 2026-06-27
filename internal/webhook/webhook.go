@@ -44,8 +44,9 @@ type Client struct {
 	webhookID string
 	listenURL string
 
-	mu           sync.Mutex
-	pendingTimer *time.Timer
+	mu            sync.Mutex
+	pendingTimer  *time.Timer
+	connectedOnce bool
 }
 
 // registration mirrors the relay's provision response (camelCase keys) plus a
@@ -161,7 +162,8 @@ func (c *Client) Run(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		if !authedAt.IsZero() && time.Since(authedAt) > 60*time.Second {
+		stable := !authedAt.IsZero() && time.Since(authedAt) > 60*time.Second
+		if stable {
 			attempt = 0 // stable authed session; reset backoff
 		}
 		backoff := time.Duration(float64(base) * float64(int64(1)<<min(attempt, 6)))
@@ -169,7 +171,13 @@ func (c *Client) Run(ctx context.Context) {
 			backoff = cap
 		}
 		sleep := time.Duration(mrand.Int64N(int64(backoff) + 1)) // full jitter
-		c.log.Warn().Err(err).Dur("retry_in", sleep.Round(time.Second)).Msg("relay disconnected")
+		if stable {
+			// A healthy connection that Cloudflare recycled — routine, not a problem.
+			c.log.Debug().Dur("retry_in", sleep.Round(time.Second)).Msg("relay connection recycled, reconnecting")
+		} else {
+			// Couldn't establish/keep a connection — escalate as it keeps failing.
+			c.log.Warn().Err(err).Dur("retry_in", sleep.Round(time.Second)).Msg("relay disconnected")
+		}
 		attempt++
 		select {
 		case <-ctx.Done():
@@ -228,7 +236,15 @@ func (c *Client) connectAndListen(ctx context.Context) (authedAt time.Time, err 
 		return time.Time{}, fmt.Errorf("auth rejected (got %q)", ready.Type)
 	}
 	authedAt = time.Now()
-	c.log.Info().Str("poke_url", c.PokeURL()).Msg("relay connected")
+	// Cloudflare recycles Durable Objects periodically, so reconnects are routine
+	// and lose no pokes (store-and-forward + the scheduled poll). Announce the
+	// first connect at INFO; keep subsequent reconnects quiet.
+	if c.connectedOnce {
+		c.log.Debug().Msg("relay reconnected")
+	} else {
+		c.connectedOnce = true
+		c.log.Info().Str("poke_url", c.PokeURL()).Msg("relay connected — instant updates enabled")
+	}
 
 	// Heartbeat.
 	hbCtx, stopHB := context.WithCancel(ctx)
